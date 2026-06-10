@@ -10,9 +10,12 @@ const REQUIRED_ENV = [
 ];
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length) {
-  console.error(`[startup] Missing required environment variables: ${missing.join(', ')}`);
-  console.error('[startup] Copy .env.example to .env and fill in the values.');
-  process.exit(1);
+  const msg = `Missing required environment variables: ${missing.join(', ')}`;
+  console.error(`[startup] ${msg}`);
+  // In serverless (Vercel) process.exit would crash the function with no response;
+  // throw instead so the error surfaces in logs and requests get a 500 with CORS headers.
+  if (require.main === module) process.exit(1);
+  else throw new Error(msg);
 }
 
 const express    = require('express');
