@@ -102,8 +102,12 @@ app.use((err, _req, res, _next) => {
   res.status(err.status || 500).json({ success: false, error: message });
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = Number(process.env.PORT) || 3001;
-app.listen(PORT, () => {
-  console.log(`DocLocker API running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
-});
+// ── Start (skipped when imported by Vercel serverless) ────────────────────────
+if (require.main === module) {
+  const PORT = Number(process.env.PORT) || 3001;
+  app.listen(PORT, () => {
+    console.log(`DocLocker API running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
+  });
+}
+
+module.exports = app;
