@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Environment secrets — NEVER commit these
+.env
+.env.local
+.env.*.local
+
+# Google credentials — contain private keys
+service_account.json
+*.key
+*.pem
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build / temp artifacts
+dist/
+build/
+tmp/
