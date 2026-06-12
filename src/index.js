@@ -18,10 +18,11 @@ if (missing.length) {
   else throw new Error(msg);
 }
 
-const express    = require('express');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const rateLimit  = require('express-rate-limit');
+const express      = require('express');
+const cors         = require('cors');
+const helmet       = require('helmet');
+const rateLimit    = require('express-rate-limit');
+const compression  = require('compression');
 
 const authRoutes     = require('./routes/auth');
 const adminsRoutes   = require('./routes/admins');
@@ -31,6 +32,9 @@ const filesRoutes    = require('./routes/files');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
+
+// ── Gzip compression (cuts JSON response size ~70%) ───────────────────────────
+app.use(compression({ level: 6, threshold: 1024 }));
 
 // ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet());

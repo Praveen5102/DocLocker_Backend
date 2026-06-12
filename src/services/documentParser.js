@@ -1,17 +1,24 @@
 function detectDocumentType(subFolder, fileName) {
   const text = (subFolder + ' ' + fileName).toLowerCase();
-  if (/adh?a+r|uid/.test(text)) return 'aadhaar';
-  if (/\bpan\b/.test(text)) return 'pan';
-  if (/passport/.test(text)) return 'passport';
-  if (/10th|ssc|matric|secondary/.test(text)) return '10th';
-  if (/12th|hsc|inter|plus.?two|higher.?sec/.test(text)) return '12th';
-  if (/provisional|p\.?c\b/.test(text)) return 'pc';
-  if (/diploma/.test(text)) return 'diploma';
+  if (/adh?a+r|uid/.test(text))                               return 'aadhaar';
+  if (/\bpan\b/.test(text))                                   return 'pan';
+  if (/passport/.test(text))                                  return 'passport';
+  if (/cibil|credit[_\s]report|credit[_\s]score/.test(text)) return 'cibil';
+  if (/10th|ssc|matric|secondary/.test(text))                 return '10th';
+  if (/12th|hsc|inter|plus.?two|higher.?sec/.test(text))      return '12th';
+  if (/provisional|p\.?c\b/.test(text))                       return 'pc';
+  if (/diploma/.test(text))                                   return 'diploma';
   if (/degree|graduation|b\.?tech|b\.?e|b\.?sc|b\.?com|b\.?a\b|mba|m\.?tech/.test(text)) return 'degree';
+  if (/\bgre\b/.test(text))                                   return 'gre';
+  if (/ielts/.test(text))                                     return 'ielts';
+  if (/toefl/.test(text))                                     return 'toefl';
+  if (/duolingo/.test(text))                                  return 'duolingo';
+  if (/i.?20|admission.letter/.test(text))                    return 'i20';
+  if (/visa.appoint|visa.slot|ds.?160/.test(text))            return 'visa_letter';
   return 'other';
 }
 
-// ── Name extractor (used by all academic doc types) ────────────────────────────
+// ── Name extractor ─────────────────────────────────────────────────────────────
 function extractNameFromText(text) {
   const patterns = [
     /(?:Student[\s]*Name|Name\s*of\s*(?:the\s*)?(?:Student|Candidate|Examinee))[:\s]+([A-Z][A-Za-z\s\.]+)/i,
@@ -31,9 +38,8 @@ function extractNameFromText(text) {
   return null;
 }
 
-// ── Score parser — handles %, CGPA (multiple scales), marks, letter grades ─────
+// ── Score parser ───────────────────────────────────────────────────────────────
 function parseScore(text) {
-  // 1. Explicit percentage
   const pctMatch =
     text.match(/(?:Percentage|Marks\s*Percentage)[:\s]+(\d{1,3}(?:\.\d{1,2})?)\s*%?/i) ||
     text.match(/(\d{1,3}(?:\.\d{1,2})?)\s*%(?!\s*\/)/);
@@ -44,7 +50,6 @@ function parseScore(text) {
     }
   }
 
-  // 2. CGPA — 10-point scale
   const cgpa10 = text.match(/CGPA[:\s]+(\d+(?:\.\d+)?)\s*\/\s*10(?:\.0)?/i) ||
                  text.match(/(\d+(?:\.\d+)?)\s*\/\s*10(?:\.0)?\b(?!\d)/);
   if (cgpa10) {
@@ -54,7 +59,6 @@ function parseScore(text) {
     }
   }
 
-  // 3. CGPA — 4-point scale
   const cgpa4 = text.match(/CGPA[:\s]+(\d+(?:\.\d+)?)\s*\/\s*4(?:\.0)?/i) ||
                 text.match(/(\d+(?:\.\d+)?)\s*\/\s*4(?:\.0)?\b(?!\d)/);
   if (cgpa4) {
@@ -64,7 +68,6 @@ function parseScore(text) {
     }
   }
 
-  // 4. CGPA — 5-point scale
   const cgpa5 = text.match(/CGPA[:\s]+(\d+(?:\.\d+)?)\s*\/\s*5(?:\.0)?/i);
   if (cgpa5) {
     const val = parseFloat(cgpa5[1]);
@@ -73,7 +76,6 @@ function parseScore(text) {
     }
   }
 
-  // 5. CGPA — 7-point scale
   const cgpa7 = text.match(/CGPA[:\s]+(\d+(?:\.\d+)?)\s*\/\s*7(?:\.0)?/i);
   if (cgpa7) {
     const val = parseFloat(cgpa7[1]);
@@ -82,7 +84,6 @@ function parseScore(text) {
     }
   }
 
-  // 6. CGPA — bare (assume 10-point)
   const cgpaRaw = text.match(/CGPA[:\s]+(\d+(?:\.\d+)?)/i);
   if (cgpaRaw) {
     const val = parseFloat(cgpaRaw[1]);
@@ -91,7 +92,6 @@ function parseScore(text) {
     }
   }
 
-  // 7. Raw marks (e.g. "450/500", "Total Marks Obtained: 450 out of 600")
   const marksMatch =
     text.match(/(?:Total\s+Marks?\s*(?:Obtained)?|Marks?\s*Obtained|Score\s*Obtained)[:\s]+(\d+)\s*(?:out\s*of\s*|\/)\s*(\d+)/i) ||
     text.match(/\b(\d{3,4})\s*\/\s*(\d{3,4})\b/);
@@ -103,7 +103,6 @@ function parseScore(text) {
     }
   }
 
-  // 8. Letter grades (O, A+, A, B+, B, C, D, F …)
   const gradeMap = { O: 92, S: 87, 'A+': 87, A: 80, 'B+': 73, B: 65, 'C+': 58, C: 52, D: 45, E: 40, F: 0 };
   const gradeMatch =
     text.match(/(?:Grade|Result|Class|Division)[:\s]+([A-Fa-f][+\-]?)\b/i) ||
@@ -142,6 +141,34 @@ function extractAadhaar(text) {
     ) {
       fields['Name'] = line;
       break;
+    }
+  }
+
+  // Address extraction — look for explicit "Address:" label first
+  const addrLabelMatch = text.match(/(?:Address|Addr)[:\s]+([^\n]{10,}(?:\n[^\n]{3,}){0,4})/i);
+  if (addrLabelMatch) {
+    fields['Address'] = addrLabelMatch[1].trim().replace(/\s+/g, ' ').slice(0, 250);
+  }
+
+  // Fallback: look for S/O or D/O + subsequent lines + PIN code pattern
+  if (!fields['Address']) {
+    const soMatch = text.match(/(?:[SDW]\/O|C\/O)[:\s]+[^\n]+(\n[^\n]+){1,4}/i);
+    if (soMatch) {
+      const chunk = soMatch[0].trim().replace(/\s+/g, ' ');
+      if (chunk.length > 15 && chunk.length < 300) fields['Address'] = chunk;
+    }
+  }
+
+  // Fallback: capture the block preceding a 6-digit PIN
+  if (!fields['Address']) {
+    const pinMatch = text.match(/\b(\d{6})\b/);
+    if (pinMatch) {
+      const pinIdx = text.indexOf(pinMatch[0]);
+      const before = text.substring(Math.max(0, pinIdx - 200), pinIdx + 6);
+      const addrLines = before.split('\n').map(l => l.trim()).filter(l => l.length > 3);
+      if (addrLines.length >= 2) {
+        fields['Address'] = addrLines.slice(-4).join(', ');
+      }
     }
   }
 
@@ -204,7 +231,7 @@ function extractPassport(text) {
   return fields;
 }
 
-// ── Academic extractors (shared logic via parseScore + extractNameFromText) ────
+// ── Academic extractors ────────────────────────────────────────────────────────
 
 function buildAcademicFields(text) {
   const fields = {};
@@ -259,6 +286,125 @@ function extractPC(text) {
   return fields;
 }
 
+// ── Test score extractors ──────────────────────────────────────────────────────
+
+function extractGRE(text) {
+  const fields = {};
+
+  const totalMatch =
+    text.match(/(?:Total|Combined)\s*Score[:\s]+(\d{3})\b/i) ||
+    text.match(/\b(2[6-9]\d|3[0-3]\d|340)\b/);
+  if (totalMatch) {
+    const val = parseInt(totalMatch[1]);
+    if (val >= 260 && val <= 340) fields['Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractIELTS(text) {
+  const fields = {};
+
+  const overallMatch =
+    text.match(/Overall\s*(?:Band\s*)?Score[:\s]+(\d+(?:\.\d)?)/i) ||
+    text.match(/Overall[:\s]+(\d+(?:\.\d)?)/i) ||
+    text.match(/\b([5-9](?:\.[05])?)\b/);
+  if (overallMatch) {
+    const val = parseFloat(overallMatch[1]);
+    if (val >= 1 && val <= 9) fields['Overall Band Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractTOEFL(text) {
+  const fields = {};
+
+  const scoreMatch =
+    text.match(/Total\s*Score[:\s]+(\d+)/i) ||
+    text.match(/Score[:\s]+(\d{2,3})/i);
+  if (scoreMatch) {
+    const val = parseInt(scoreMatch[1]);
+    if (val >= 0 && val <= 120) fields['Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractDuolingo(text) {
+  const fields = {};
+
+  const scoreMatch =
+    text.match(/(?:Overall|Score)[:\s]+(\d{2,3})/i) ||
+    text.match(/(\d{2,3})\s*\/\s*160/);
+  if (scoreMatch) {
+    const val = parseInt(scoreMatch[1]);
+    if (val >= 10 && val <= 160) fields['Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractI20(text) {
+  const fields = {};
+
+  const uniMatch =
+    text.match(/(?:School|Institution|University|College|Institute)[:\s]+([A-Z][^\n]{3,80})/i);
+  if (uniMatch) fields['University'] = uniMatch[1].trim().slice(0, 80);
+
+  const programMatch =
+    text.match(/(?:Program|Degree|Course|Major|Field of Study)[:\s]+([^\n]{3,80})/i);
+  if (programMatch) fields['Program'] = programMatch[1].trim().slice(0, 80);
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractVisaLetter(text) {
+  const fields = {};
+
+  const dateMatch =
+    text.match(/(?:Appointment|Interview)\s*(?:Date|Time)[:\s]+([^\n]{3,30})/i) ||
+    text.match(/\b(\d{2}[\/\-]\d{2}[\/\-]\d{4})\b/);
+  if (dateMatch) fields['Appointment Date'] = dateMatch[1].trim();
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractCIBIL(text) {
+  const fields = {};
+
+  const scoreMatch =
+    text.match(/(?:CIBIL\s+Score|Credit\s+Score|TransUnion\s+Score)[:\s]+(\d{3})/i) ||
+    text.match(/\b([3-9]\d{2})\b/);
+  if (scoreMatch) {
+    const val = parseInt(scoreMatch[1]);
+    if (val >= 300 && val <= 900) fields['Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
 function extractOther(text) {
   const fields = {};
 
@@ -284,15 +430,22 @@ function parseDocument(extraction) {
   let fields = {};
 
   switch (type) {
-    case 'aadhaar':  fields = extractAadhaar(extractedText);  break;
-    case 'pan':      fields = extractPAN(extractedText);      break;
-    case 'passport': fields = extractPassport(extractedText); break;
-    case 'pc':       fields = extractPC(extractedText);       break;
+    case 'aadhaar':    fields = extractAadhaar(extractedText);    break;
+    case 'pan':        fields = extractPAN(extractedText);        break;
+    case 'passport':   fields = extractPassport(extractedText);   break;
+    case 'pc':         fields = extractPC(extractedText);         break;
     case '10th':
     case '12th':
     case 'degree':
-    case 'diploma':  fields = extractAcademic(extractedText); break;
-    default:         fields = extractOther(extractedText);    break;
+    case 'diploma':    fields = extractAcademic(extractedText);   break;
+    case 'gre':        fields = extractGRE(extractedText);        break;
+    case 'ielts':      fields = extractIELTS(extractedText);      break;
+    case 'toefl':      fields = extractTOEFL(extractedText);      break;
+    case 'duolingo':   fields = extractDuolingo(extractedText);   break;
+    case 'i20':        fields = extractI20(extractedText);        break;
+    case 'visa_letter':fields = extractVisaLetter(extractedText); break;
+    case 'cibil':      fields = extractCIBIL(extractedText);      break;
+    default:           fields = extractOther(extractedText);      break;
   }
 
   return { type, subFolder, sourceFile, fields };
