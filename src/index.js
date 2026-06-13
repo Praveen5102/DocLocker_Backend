@@ -45,9 +45,16 @@ const allowedOrigins = (process.env.CORS_ORIGIN || 'http://localhost:5173')
 
 app.use(cors({
   origin(origin, cb) {
-    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-      return cb(null, true);
-    }
+    // Server-to-server (no origin header) — always allow
+    if (!origin) return cb(null, true);
+    // Wildcard — allow everything
+    if (allowedOrigins.includes('*')) return cb(null, true);
+    // Exact match from CORS_ORIGIN list
+    if (allowedOrigins.includes(origin)) return cb(null, true);
+    // Allow any Vercel deployment URL (production + all preview builds)
+    if (origin.endsWith('.vercel.app')) return cb(null, true);
+    // Allow localhost on any port for local dev (http and https)
+    if (/^https?:\/\/localhost(:\d+)?$/.test(origin)) return cb(null, true);
     cb(new Error(`CORS: origin ${origin} not allowed`));
   },
   credentials: true,
