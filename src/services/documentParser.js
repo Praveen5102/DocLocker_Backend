@@ -12,6 +12,8 @@ function detectDocumentType(subFolder, fileName) {
   if (/\bgre\b/.test(text))                                   return 'gre';
   if (/ielts/.test(text))                                     return 'ielts';
   if (/toefl/.test(text))                                     return 'toefl';
+  if (/\bgmat\b/.test(text))                                  return 'gmat';
+  if (/\bpte\b/.test(text))                                   return 'pte';
   if (/duolingo/.test(text))                                  return 'duolingo';
   if (/i.?20|admission.letter/.test(text))                    return 'i20';
   if (/visa.appoint|visa.slot|ds.?160/.test(text))            return 'visa_letter';
@@ -340,6 +342,40 @@ function extractTOEFL(text) {
   return fields;
 }
 
+function extractGMAT(text) {
+  const fields = {};
+
+  const totalMatch =
+    text.match(/Total\s*Score[:\s]+(\d{3})\b/i) ||
+    text.match(/\b([2-7]\d{2})\b/);
+  if (totalMatch) {
+    const val = parseInt(totalMatch[1]);
+    if (val >= 200 && val <= 800) fields['Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
+function extractPTE(text) {
+  const fields = {};
+
+  const scoreMatch =
+    text.match(/Overall\s*Score[:\s]+(\d{2})/i) ||
+    text.match(/Score[:\s]+(\d{2})/i);
+  if (scoreMatch) {
+    const val = parseInt(scoreMatch[1]);
+    if (val >= 10 && val <= 90) fields['Score'] = val;
+  }
+
+  const name = extractNameFromText(text);
+  if (name) fields['Name'] = name;
+
+  return fields;
+}
+
 function extractDuolingo(text) {
   const fields = {};
 
@@ -441,6 +477,8 @@ function parseDocument(extraction) {
     case 'gre':        fields = extractGRE(extractedText);        break;
     case 'ielts':      fields = extractIELTS(extractedText);      break;
     case 'toefl':      fields = extractTOEFL(extractedText);      break;
+    case 'gmat':       fields = extractGMAT(extractedText);       break;
+    case 'pte':        fields = extractPTE(extractedText);        break;
     case 'duolingo':   fields = extractDuolingo(extractedText);   break;
     case 'i20':        fields = extractI20(extractedText);        break;
     case 'visa_letter':fields = extractVisaLetter(extractedText); break;
