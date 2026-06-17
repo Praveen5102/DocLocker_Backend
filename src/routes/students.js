@@ -6,14 +6,18 @@ const { studentsCache } = require('../services/cache');
 const router = express.Router();
 
 // student_meta.json now lives in the "Others" subfolder; older students may still
-// have it sitting at the folder root from before this change, so check both.
+// have it sitting at the folder root from before this change, so check both —
+// in parallel, to avoid doubling/tripling per-folder Drive round trips.
 async function findMetaFile(folderId) {
-  const othersDir = await findFolderByName(folderId, 'Others');
+  const [othersDir, rootFiles] = await Promise.all([
+    findFolderByName(folderId, 'Others'),
+    findFilesByName(folderId, 'student_meta.json'),
+  ]);
   if (othersDir) {
     const inOthers = await findFilesByName(othersDir.id, 'student_meta.json');
     if (inOthers.length > 0) return inOthers;
   }
-  return findFilesByName(folderId, 'student_meta.json');
+  return rootFiles;
 }
 
 // GET /api/students — list all (JWT required)
@@ -55,19 +59,22 @@ router.get('/find', async (req, res) => {
     if (!identifier) return res.status(400).json({ success: false, error: 'Missing identifier' });
 
     const folders = await listFolders(ROOT_FOLDER_ID());
-    for (const folder of folders) {
-      const metaFiles = await findMetaFile(folder.id);
-      if (metaFiles.length > 0) {
+    const results = await Promise.all(
+      folders.map(async (folder) => {
         try {
+          const metaFiles = await findMetaFile(folder.id);
+          if (metaFiles.length === 0) return null;
           const meta = await readJsonFile(metaFiles[0].id);
           if (meta.email === identifier || meta.phone === identifier) {
             meta.driveUrl = folder.webViewLink;
-            return res.json({ success: true, student: meta });
+            return meta;
           }
         } catch (_) {}
-      }
-    }
-    res.json({ success: false, student: null });
+        return null;
+      })
+    );
+    const match = results.find(Boolean);
+    res.json({ success: !!match, student: match || null });
   } catch (err) {
     console.error('findStudent error:', err.message);
     res.status(500).json({ success: false, error: err.message });
