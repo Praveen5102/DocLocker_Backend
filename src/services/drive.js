@@ -45,6 +45,20 @@ async function getOrCreate(parentId, name) {
   return created.data;
 }
 
+// Read-only lookup — unlike getOrCreate, never creates the folder as a side effect.
+// Returns the folder { id, name } or null if it doesn't exist.
+async function findFolderByName(parentId, name) {
+  const drive = getDrive();
+  const safeName = sanitize(name);
+  const res = await drive.files.list({
+    q: `name = '${escapeQ(safeName)}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: 'files(id, name)',
+    spaces: 'drive',
+    pageSize: 1,
+  });
+  return res.data.files.length > 0 ? res.data.files[0] : null;
+}
+
 async function listFolders(parentId) {
   const drive = getDrive();
   const res = await drive.files.list({
@@ -115,6 +129,7 @@ module.exports = {
   ROOT_FOLDER_ID,
   sanitize,
   getOrCreate,
+  findFolderByName,
   listFolders,
   findFilesByName,
   readJsonFile,

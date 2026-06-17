@@ -1,9 +1,20 @@
 const express = require('express');
-const { ROOT_FOLDER_ID, sanitize, listFolders, findFilesByName, readJsonFile, trashFile } = require('../services/drive');
+const { ROOT_FOLDER_ID, sanitize, listFolders, findFilesByName, findFolderByName, readJsonFile, trashFile } = require('../services/drive');
 const { verifyJWT } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 
 const router = express.Router();
+
+// student_meta.json now lives in the "Others" subfolder; older students may still
+// have it sitting at the folder root from before this change, so check both.
+async function findMetaFile(folderId) {
+  const othersDir = await findFolderByName(folderId, 'Others');
+  if (othersDir) {
+    const inOthers = await findFilesByName(othersDir.id, 'student_meta.json');
+    if (inOthers.length > 0) return inOthers;
+  }
+  return findFilesByName(folderId, 'student_meta.json');
+}
 
 // GET /api/students — list all (JWT required)
 router.get('/', verifyJWT, async (req, res) => {
@@ -16,7 +27,7 @@ router.get('/', verifyJWT, async (req, res) => {
     const students = await Promise.all(
       folders.map(async (folder) => {
         const obj = { name: folder.name, driveUrl: folder.webViewLink };
-        const metaFiles = await findFilesByName(folder.id, 'student_meta.json');
+        const metaFiles = await findMetaFile(folder.id);
         if (metaFiles.length > 0) {
           try {
             const meta = await readJsonFile(metaFiles[0].id);
@@ -45,7 +56,7 @@ router.get('/find', async (req, res) => {
 
     const folders = await listFolders(ROOT_FOLDER_ID());
     for (const folder of folders) {
-      const metaFiles = await findFilesByName(folder.id, 'student_meta.json');
+      const metaFiles = await findMetaFile(folder.id);
       if (metaFiles.length > 0) {
         try {
           const meta = await readJsonFile(metaFiles[0].id);

@@ -66,9 +66,11 @@ router.post('/meta', async (req, res) => {
     const { studentName, metaJson } = req.body;
     if (!studentName || !metaJson) return res.status(400).json({ success: false, error: 'Missing studentName or metaJson' });
 
-    const stuDir = await getOrCreate(ROOT_FOLDER_ID(), sanitize(studentName));
-    await trashFilesByName(stuDir.id, 'student_meta.json');
-    const file = await createJsonFile(stuDir.id, 'student_meta.json', JSON.parse(metaJson));
+    const stuDir   = await getOrCreate(ROOT_FOLDER_ID(), sanitize(studentName));
+    const othersDir = await getOrCreate(stuDir.id, 'Others');
+    await trashFilesByName(stuDir.id, 'student_meta.json');   // clean up legacy root-level copy, if any
+    await trashFilesByName(othersDir.id, 'student_meta.json');
+    const file = await createJsonFile(othersDir.id, 'student_meta.json', JSON.parse(metaJson));
 
     studentsCache.clear();
     res.json({ success: true, fileId: file.id });
@@ -86,20 +88,23 @@ router.post('/summary', async (req, res) => {
     const { studentName, htmlContent, documents = [] } = req.body;
     if (!studentName || !htmlContent) return res.status(400).json({ success: false, error: 'Missing studentName or htmlContent' });
 
-    const stuDir = await getOrCreate(ROOT_FOLDER_ID(), sanitize(studentName));
+    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), sanitize(studentName));
+    const othersDir = await getOrCreate(stuDir.id, 'Others');
 
     // Summary PDF = exactly the frontend HTML
-    await trashFilesByName(stuDir.id, 'Student_Summary.pdf');
+    await trashFilesByName(stuDir.id, 'Student_Summary.pdf');   // clean up legacy root-level copy, if any
+    await trashFilesByName(othersDir.id, 'Student_Summary.pdf');
     const summaryBuf      = await convertHtmlToPdf(htmlContent, sanitize(studentName));
-    const summaryUploaded = await uploadBuffer(stuDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf);
+    const summaryUploaded = await uploadBuffer(othersDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf);
 
     // Eligibility report — auto-generated using documents passed from frontend
     let eligibilityReport = null;
     try {
       const eligHtml   = buildEligibilityHtml(sanitize(studentName), documents);
-      await trashFilesByName(stuDir.id, 'Eligibility_Report.pdf');
+      await trashFilesByName(stuDir.id, 'Eligibility_Report.pdf');   // clean up legacy root-level copy, if any
+      await trashFilesByName(othersDir.id, 'Eligibility_Report.pdf');
       const eligBuf    = await convertHtmlToPdf(eligHtml, sanitize(studentName) + '_Elig');
-      const eligUpload = await uploadBuffer(stuDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf);
+      const eligUpload = await uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf);
       eligibilityReport = { fileId: eligUpload.id, webViewLink: eligUpload.webViewLink };
     } catch (e) {
       console.error('Eligibility report failed:', e.message);
@@ -124,12 +129,14 @@ router.post('/eligibility-report', async (req, res) => {
     const { studentName, documents = [] } = req.body;
     if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });
 
-    const stuDir   = await getOrCreate(ROOT_FOLDER_ID(), sanitize(studentName));
-    const html     = buildEligibilityHtml(sanitize(studentName), documents);
+    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), sanitize(studentName));
+    const othersDir = await getOrCreate(stuDir.id, 'Others');
+    const html      = buildEligibilityHtml(sanitize(studentName), documents);
 
-    await trashFilesByName(stuDir.id, 'Eligibility_Report.pdf');
+    await trashFilesByName(stuDir.id, 'Eligibility_Report.pdf');   // clean up legacy root-level copy, if any
+    await trashFilesByName(othersDir.id, 'Eligibility_Report.pdf');
     const pdfBuf   = await convertHtmlToPdf(html, sanitize(studentName) + '_Elig');
-    const uploaded = await uploadBuffer(stuDir.id, 'Eligibility_Report.pdf', 'application/pdf', pdfBuf);
+    const uploaded = await uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', pdfBuf);
 
     res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink });
   } catch (err) {
