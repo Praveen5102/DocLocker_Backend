@@ -33,6 +33,13 @@ const filesRoutes    = require('./routes/files');
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
 
+// Railway (and most PaaS hosts) sit behind a single reverse proxy hop, which
+// sets X-Forwarded-For. Without trust proxy, express-rate-limit refuses to use
+// that header (correctly, to prevent IP spoofing) and logs a warning on every
+// request. Trusting exactly 1 hop tells Express to read the real client IP
+// from the proxy while still rejecting spoofed X-Forwarded-For chains beyond it.
+app.set('trust proxy', 1);
+
 // ── Gzip compression (cuts JSON response size ~70%) ───────────────────────────
 app.use(compression({ level: 6, threshold: 1024 }));
 
