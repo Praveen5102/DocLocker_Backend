@@ -24,6 +24,16 @@ function sanitize(name) {
   return (String(name || 'Unknown').replace(/[^a-zA-Z0-9 _\-.]/g, '_').trim() || 'Unknown');
 }
 
+// Mirrors Frontend/src/utils/driveApi.js's buildFolderKey — student folders are
+// named "{name}__{identifier}" when an identifier (email/phone) is known, so
+// any backend lookup by name alone must reconstruct the same key or it won't
+// find the folder (and getOrCreate would silently create an empty duplicate).
+function buildFolderKey(name, identifier = '') {
+  const safeName = (name || 'Unknown').trim();
+  const safeId = (identifier || '').trim().replace(/[^a-zA-Z0-9@._+-]/g, '');
+  return safeId ? `${safeName}__${safeId}` : safeName;
+}
+
 function escapeQ(str) {
   return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
@@ -68,6 +78,50 @@ async function listFolders(parentId) {
     pageSize: 1000,
   });
   return res.data.files || [];
+}
+
+// Files (not folders) directly inside a folder.
+async function listFilesInFolder(parentId) {
+  const drive = getDrive();
+  const res = await drive.files.list({
+    q: `'${parentId}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: 'files(id, name, mimeType, size, webViewLink)',
+    spaces: 'drive',
+    pageSize: 1000,
+  });
+  return res.data.files || [];
+}
+
+// Grants "anyone with the link can view" on a single file — used for sharing
+// specific documents with an external party (e.g. a bank) without exposing
+// the rest of the student's folder.
+async function shareFilePublicly(fileId) {
+  const drive = getDrive();
+  await drive.permissions.create({
+    fileId,
+    requestBody: { role: 'reader', type: 'anyone' },
+    fields: 'id',
+  });
+}
+
+// Walks every subfolder under rootFolderId and returns a flat list of every
+// file found, each tagged with the relative folder path it came from.
+async function listAllFilesRecursive(rootFolderId, relativePath = '') {
+  const [files, subfolders] = await Promise.all([
+    listFilesInFolder(rootFolderId),
+    listFolders(rootFolderId),
+  ]);
+
+  let all = files.map((f) => ({ ...f, relativePath }));
+
+  const nested = await Promise.all(
+    subfolders.map((sub) =>
+      listAllFilesRecursive(sub.id, relativePath ? `${relativePath}/${sub.name}` : sub.name),
+    ),
+  );
+  for (const list of nested) all = all.concat(list);
+
+  return all;
 }
 
 async function findFilesByName(parentId, name) {
@@ -128,9 +182,13 @@ module.exports = {
   getDrive,
   ROOT_FOLDER_ID,
   sanitize,
+  buildFolderKey,
   getOrCreate,
   findFolderByName,
   listFolders,
+  listFilesInFolder,
+  listAllFilesRecursive,
+  shareFilePublicly,
   findFilesByName,
   readJsonFile,
   trashFile,

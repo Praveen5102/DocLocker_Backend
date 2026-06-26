@@ -29,6 +29,8 @@ const adminsRoutes   = require('./routes/admins');
 const advisorsRoutes = require('./routes/advisors');
 const studentsRoutes = require('./routes/students');
 const filesRoutes    = require('./routes/files');
+const banksRoutes    = require('./routes/banks');
+const sendRoutes     = require('./routes/send');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -110,6 +112,8 @@ app.use('/api/auth',     authRoutes);
 app.use('/api/admins',   adminsRoutes);
 app.use('/api/advisors', advisorsRoutes);
 app.use('/api/students', studentsRoutes);
+app.use('/api/banks',    banksRoutes);
+app.use('/api/send-to-bank', sendRoutes);
 app.use('/api',          filesRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
