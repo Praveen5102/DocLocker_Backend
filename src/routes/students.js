@@ -1,6 +1,6 @@
 const express = require('express');
 const { ROOT_FOLDER_ID, sanitize, listFolders, findFilesByName, findFolderByName, readJsonFile, trashFile } = require('../services/drive');
-const { verifyJWT } = require('../middleware/auth');
+const { verifyJWT, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 
 const router = express.Router();
@@ -21,30 +21,37 @@ async function findMetaFile(folderId) {
 }
 
 // GET /api/students — list all (JWT required)
+// Bankers never receive the full list over the wire — only students they've
+// been explicitly granted access to, filtered server-side before responding.
 router.get('/', verifyJWT, async (req, res) => {
   try {
+    let students;
     if (studentsCache.isValid()) {
-      return res.json({ success: true, students: studentsCache.data });
+      students = studentsCache.data;
+    } else {
+      const folders = await listFolders(ROOT_FOLDER_ID());
+      students = await Promise.all(
+        folders.map(async (folder) => {
+          const obj = { name: folder.name, driveUrl: folder.webViewLink };
+          const metaFiles = await findMetaFile(folder.id);
+          if (metaFiles.length > 0) {
+            try {
+              const meta = await readJsonFile(metaFiles[0].id);
+              return { ...obj, ...meta };
+            } catch (err) {
+              return { ...obj, _parseError: err.message };
+            }
+          }
+          return obj;
+        })
+      );
+      studentsCache.set(students);
     }
 
-    const folders = await listFolders(ROOT_FOLDER_ID());
-    const students = await Promise.all(
-      folders.map(async (folder) => {
-        const obj = { name: folder.name, driveUrl: folder.webViewLink };
-        const metaFiles = await findMetaFile(folder.id);
-        if (metaFiles.length > 0) {
-          try {
-            const meta = await readJsonFile(metaFiles[0].id);
-            return { ...obj, ...meta };
-          } catch (err) {
-            return { ...obj, _parseError: err.message };
-          }
-        }
-        return obj;
-      })
-    );
+    if (req.admin.role === 'banker') {
+      students = students.filter((s) => (s.sharedBankers || []).includes(req.admin.name));
+    }
 
-    studentsCache.set(students);
     res.json({ success: true, students });
   } catch (err) {
     console.error('listStudents error:', err.message);
@@ -81,8 +88,8 @@ router.get('/find', async (req, res) => {
   }
 });
 
-// DELETE /api/students — delete student folder (JWT required)
-router.delete('/', verifyJWT, async (req, res) => {
+// DELETE /api/students — delete student folder (staff only)
+router.delete('/', verifyJWT, requireStaff, async (req, res) => {
   try {
     const { studentName } = req.body;
     if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });

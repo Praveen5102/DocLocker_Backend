@@ -177,6 +177,39 @@ async function uploadBuffer(parentId, filename, mimeType, buffer) {
   return res.data;
 }
 
+async function getFileMeta(fileId) {
+  const drive = getDrive();
+  const res = await drive.files.get({ fileId, fields: 'id, name, mimeType, parents' });
+  return res.data;
+}
+
+// Walks a file's ancestors up to ROOT_FOLDER_ID and returns the name of the
+// student folder it lives under (the folder whose direct parent is root),
+// or null if the file isn't under a recognizable student folder at all.
+// Used to authorize banker access to a single file without exposing the
+// whole Drive tree.
+async function findStudentFolderKeyForFile(fileId) {
+  const root = ROOT_FOLDER_ID();
+  let current = await getFileMeta(fileId);
+  for (let depth = 0; depth < 6; depth++) {
+    const parentId = current.parents && current.parents[0];
+    if (!parentId) return null;
+    if (parentId === root) return current.name;
+    current = await getFileMeta(parentId);
+  }
+  return null;
+}
+
+// Streams raw file bytes straight from Drive — used by the secure proxy
+// endpoint so bankers/staff never need direct Drive permissions; access is
+// gated entirely by our own JWT + folder-ownership check before this is called.
+async function getFileContentStream(fileId) {
+  const drive = getDrive();
+  const meta = await getFileMeta(fileId);
+  const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+  return { stream: res.data, mimeType: meta.mimeType, name: meta.name };
+}
+
 
 module.exports = {
   getDrive,
@@ -195,4 +228,7 @@ module.exports = {
   trashFilesByName,
   createJsonFile,
   uploadBuffer,
+  getFileMeta,
+  findStudentFolderKeyForFile,
+  getFileContentStream,
 };
