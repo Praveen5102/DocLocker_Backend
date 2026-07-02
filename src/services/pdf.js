@@ -126,4 +126,4 @@ async function convertHtmlToPdf(htmlContent, label) {
   }
 }
 
-module.exports = { convertToPdf, convertHtmlToPdf };
+module.exports = { convertToPdf, convertHtmlToPdf, extractTextViaOcr };

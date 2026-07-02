@@ -7,8 +7,7 @@ async function readStudentMeta(stuDirId) {
   const candidates = othersDir ? await findFilesByName(othersDir.id, 'student_meta.json') : [];
   const files = candidates.length > 0 ? candidates : await findFilesByName(stuDirId, 'student_meta.json');
   if (files.length === 0) return { meta: {}, fileId: null };
-  try { return { meta: await readJsonFile(files[0].id), fileId: files[0].id }; }
-  catch { return { meta: {}, fileId: null }; }
+  return { meta: await readJsonFile(files[0].id), fileId: files[0].id };
 }
 
 async function writeStudentMeta(stuDirId, data) {

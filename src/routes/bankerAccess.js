@@ -1,9 +1,10 @@
 const express = require('express');
+const archiver = require('archiver');
 const {
-  ROOT_FOLDER_ID, sanitize, buildFolderKey, findFolderByName, listAllFilesRecursive,
+  ROOT_FOLDER_ID, sanitize, buildFolderKey, findFolderByName, listAllFilesRecursive, readFileBuffer,
 } = require('../services/drive');
 const { readStudentMeta, writeStudentMeta } = require('../services/studentMeta');
-const { verifyJWT, requireStaff } = require('../middleware/auth');
+const { verifyJWT, verifyJWTFlexible, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 
 const router = express.Router();
@@ -35,6 +36,7 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
     meta.sharedBankers = Array.from(current);
 
     await writeStudentMeta(stuDir.id, meta);
+    studentsCache.clear();
     res.json({ success: true, sharedBankers: meta.sharedBankers });
   } catch (err) {
     console.error('bankerAccess error:', err.message);
@@ -119,6 +121,61 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
   } catch (err) {
     console.error('loanStatus update error:', err.message);
     res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// GET /api/students/:studentKey/files/zip — download all visible docs as a zip
+// Same access rules as the files listing endpoint.
+router.get('/:studentKey/files/zip', verifyJWTFlexible, async (req, res) => {
+  try {
+    const folderKey = sanitize(req.params.studentKey);
+    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
+    if (!stuDir) {
+      return res.status(404).json({ success: false, error: 'Student folder not found' });
+    }
+
+    if (req.admin.role === 'banker') {
+      const { meta } = await readStudentMeta(stuDir.id);
+      const shared = new Set(meta.sharedBankers || []);
+      if (!shared.has(req.admin.name)) {
+        return res.status(403).json({ success: false, error: 'You do not have access to this student' });
+      }
+    }
+
+    const allFiles = await listAllFilesRecursive(stuDir.id);
+    const visible = allFiles.filter((f) => !EXCLUDED_FILENAMES.has(f.name.toLowerCase()));
+
+    if (visible.length === 0) {
+      return res.status(404).json({ success: false, error: 'No documents found' });
+    }
+
+    const safeFolderKey = folderKey.replace(/[^a-zA-Z0-9_\-.]/g, '_');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFolderKey}_documents.zip"`);
+
+    const archive = archiver('zip', { zlib: { level: 5 } });
+    archive.on('error', (err) => {
+      console.error('archiver error:', err.message);
+      if (!res.headersSent) res.status(500).end();
+    });
+    archive.pipe(res);
+
+    // Fetch and append each file; skip individual failures so one bad file
+    // doesn't abort the whole zip.
+    for (const f of visible) {
+      try {
+        const buf = await readFileBuffer(f.id);
+        const entryPath = f.relativePath ? `${f.relativePath}/${f.name}` : f.name;
+        archive.append(buf, { name: entryPath });
+      } catch (fileErr) {
+        console.warn(`zip: skipping "${f.name}" — ${fileErr.message}`);
+      }
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error('filesZip error:', err.message);
+    if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
   }
 });
 

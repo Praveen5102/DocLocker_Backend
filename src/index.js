@@ -31,6 +31,7 @@ const studentsRoutes    = require('./routes/students');
 const filesRoutes       = require('./routes/files');
 const bankerAccessRoutes = require('./routes/bankerAccess');
 const fileProxyRoutes   = require('./routes/fileProxy');
+const recoveryRoutes    = require('./routes/recovery');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -113,6 +114,7 @@ app.use('/api/admins',   adminsRoutes);
 app.use('/api/advisors', advisorsRoutes);
 app.use('/api/students', studentsRoutes);
 app.use('/api/students', bankerAccessRoutes);
+app.use('/api/students', recoveryRoutes);
 app.use('/api/files',    fileProxyRoutes);
 app.use('/api',          filesRoutes);
 

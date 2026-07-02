@@ -141,6 +141,12 @@ async function readFile(fileId) {
   return Buffer.from(res.data).toString('utf-8');
 }
 
+async function readFileBuffer(fileId) {
+  const drive = getDrive();
+  const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'arraybuffer' });
+  return Buffer.from(res.data);
+}
+
 async function readJsonFile(fileId) {
   const text = await readFile(fileId);
   return JSON.parse(text);
@@ -224,6 +230,7 @@ module.exports = {
   shareFilePublicly,
   findFilesByName,
   readJsonFile,
+  readFileBuffer,
   trashFile,
   trashFilesByName,
   createJsonFile,
