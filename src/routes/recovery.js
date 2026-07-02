@@ -122,7 +122,7 @@ router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, re
 
     const client = getAnthropicClient();
     const message = await client.messages.create({
-      model: 'claude-sonnet-5-20251101',
+      model: 'claude-sonnet-5',
       max_tokens: 4096,
       system: RECOVERY_SYSTEM_PROMPT,
       messages: [
