@@ -38,7 +38,7 @@ router.get('/:fileId/content', verifyJWTFlexible, async (req, res) => {
     stream.pipe(res);
   } catch (err) {
     console.error('fileProxy error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 

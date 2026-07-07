@@ -8,13 +8,14 @@ const { convertToPdf, convertHtmlToPdf } = require('../services/pdf');
 const { parseDocument }                  = require('../services/documentParser');
 const { buildEligibilityHtml }           = require('../services/eligibilityReport');
 const { studentsCache }                  = require('../services/cache');
+const { verifyJWT, requireStaff }        = require('../middleware/auth');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
 // POST /api/upload
 // Returns parsedData in response — frontend holds this, no JSON saved to Drive
-router.post('/upload', upload.single('file'), async (req, res) => {
+router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (req, res) => {
   try {
     const { studentName, subFolder, fileName } = req.body;
     const file = req.file;
@@ -56,12 +57,12 @@ router.post('/upload', upload.single('file'), async (req, res) => {
     res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink, fileName: uploaded.name, parsedData });
   } catch (err) {
     console.error('Upload error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
 // POST /api/meta
-router.post('/meta', async (req, res) => {
+router.post('/meta', verifyJWT, requireStaff, async (req, res) => {
   try {
     const { studentName, metaJson } = req.body;
     if (!studentName || !metaJson) return res.status(400).json({ success: false, error: 'Missing studentName or metaJson' });
@@ -76,14 +77,14 @@ router.post('/meta', async (req, res) => {
     res.json({ success: true, fileId: file.id });
   } catch (err) {
     console.error('saveMeta error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
 // POST /api/summary
 // Body: { studentName, htmlContent, documents: [...parsedData] }
 // documents = array of parsedData objects collected by frontend from upload responses
-router.post('/summary', async (req, res) => {
+router.post('/summary', verifyJWT, requireStaff, async (req, res) => {
   try {
     const { studentName, htmlContent, documents = [] } = req.body;
     if (!studentName || !htmlContent) return res.status(400).json({ success: false, error: 'Missing studentName or htmlContent' });
@@ -118,13 +119,13 @@ router.post('/summary', async (req, res) => {
     });
   } catch (err) {
     console.error('saveSummaryPdf error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
 // POST /api/eligibility-report — standalone regeneration
 // Body: { studentName, documents: [...parsedData] }
-router.post('/eligibility-report', async (req, res) => {
+router.post('/eligibility-report', verifyJWT, requireStaff, async (req, res) => {
   try {
     const { studentName, documents = [] } = req.body;
     if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });
@@ -141,7 +142,7 @@ router.post('/eligibility-report', async (req, res) => {
     res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink });
   } catch (err) {
     console.error('eligibilityReport error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 

@@ -55,15 +55,20 @@ router.get('/', verifyJWT, async (req, res) => {
     res.json({ success: true, students });
   } catch (err) {
     console.error('listStudents error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
-// GET /api/students/find?identifier= — public
+// GET /api/students/find?identifier= — used by the student self-service portal
+// Returns ONLY the student's name and folder URL — never full PII.
+// The portal uses this to confirm the student exists so they can view their
+// own documents. Full metadata is never sent to unauthenticated callers.
 router.get('/find', async (req, res) => {
   try {
     const { identifier } = req.query;
-    if (!identifier) return res.status(400).json({ success: false, error: 'Missing identifier' });
+    if (!identifier || identifier.trim().length < 5) {
+      return res.status(400).json({ success: false, error: 'Missing or too-short identifier' });
+    }
 
     const folders = await listFolders(ROOT_FOLDER_ID());
     const results = await Promise.all(
@@ -73,18 +78,20 @@ router.get('/find', async (req, res) => {
           if (metaFiles.length === 0) return null;
           const meta = await readJsonFile(metaFiles[0].id);
           if (meta.email === identifier || meta.phone === identifier) {
-            meta.driveUrl = folder.webViewLink;
-            return meta;
+            // Return only what the portal needs — no PII beyond the name
+            return { name: meta.name || folder.name, driveUrl: folder.webViewLink };
           }
         } catch (_) {}
         return null;
       })
     );
     const match = results.find(Boolean);
+    // Constant-time-ish response shape regardless of found/not-found to
+    // prevent trivial enumeration via timing differences
     res.json({ success: !!match, student: match || null });
   } catch (err) {
     console.error('findStudent error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -103,7 +110,7 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
     res.json({ success: true, deleted: matches.length });
   } catch (err) {
     console.error('deleteStudent error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 

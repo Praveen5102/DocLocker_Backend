@@ -17,7 +17,7 @@ router.get('/', async (req, res) => {
     advisorsCache.set(advisors);
     res.json({ success: true, advisors });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 

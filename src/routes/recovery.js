@@ -158,7 +158,7 @@ router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, re
     res.json({ success: true, recovered, warning, existingFieldCount });
   } catch (err) {
     console.error('recover-meta error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -185,7 +185,7 @@ router.post('/:studentKey/restore-meta', verifyJWT, requireStaff, async (req, re
     res.json({ success: true });
   } catch (err) {
     console.error('restore-meta error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 

@@ -40,7 +40,7 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
     res.json({ success: true, sharedBankers: meta.sharedBankers });
   } catch (err) {
     console.error('bankerAccess error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -76,7 +76,7 @@ router.get('/:studentKey/files', verifyJWT, async (req, res) => {
     res.json({ success: true, groups });
   } catch (err) {
     console.error('studentFiles error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -120,7 +120,7 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
     res.json({ success: true, loanStatus: meta.loanStatus, loanRemark: meta.loanRemark });
   } catch (err) {
     console.error('loanStatus update error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
@@ -175,7 +175,7 @@ router.get('/:studentKey/files/zip', verifyJWTFlexible, async (req, res) => {
     await archive.finalize();
   } catch (err) {
     console.error('filesZip error:', err.message);
-    if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
+    if (!res.headersSent) res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
