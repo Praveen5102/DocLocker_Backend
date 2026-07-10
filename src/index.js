@@ -143,7 +143,7 @@ app.use((err, _req, res, _next) => {
 if (require.main === module) {
   const PORT = Number(process.env.PORT) || 3001;
   app.listen(PORT, () => {
-    console.log(`GuideUni API running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
+    console.log(`DocLocker API running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
   });
 }
 

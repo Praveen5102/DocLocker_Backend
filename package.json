@@ -1,7 +1,7 @@
 {
-  "name": "guideuni-backend",
+  "name": "doclocker-backend",
   "version": "1.0.0",
-  "description": "Express.js backend for GuideUni — Google Drive API proxy",
+  "description": "Express.js backend for DocLocker — Google Drive API proxy",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
