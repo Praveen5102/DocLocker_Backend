@@ -34,6 +34,22 @@ function buildFolderKey(name, identifier = '') {
   return safeId ? `${safeName}__${safeId}` : safeName;
 }
 
+// Sanitize a folderKey without stripping @ from the identifier portion.
+// sanitize() treats @ as an illegal char and replaces it with _, which breaks
+// email-based folder lookup. This function only sanitizes the name part (before __).
+function cleanFolderKey(key) {
+  const k = String(key || '');
+  const sep = k.indexOf('__');
+  return sep >= 0 ? sanitize(k.slice(0, sep)) + '__' + k.slice(sep + 2) : sanitize(k);
+}
+
+// Extract the display name (part before __) from a folderKey, sanitized.
+function folderKeyDisplayName(key) {
+  const k = String(key || '');
+  const sep = k.indexOf('__');
+  return sanitize(sep >= 0 ? k.slice(0, sep) : k);
+}
+
 function escapeQ(str) {
   return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
@@ -222,6 +238,8 @@ module.exports = {
   ROOT_FOLDER_ID,
   sanitize,
   buildFolderKey,
+  cleanFolderKey,
+  folderKeyDisplayName,
   getOrCreate,
   findFolderByName,
   listFolders,

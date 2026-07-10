@@ -99,9 +99,21 @@ const apiLimiter = rateLimit({
   message: { success: false, error: 'Too many requests, please try again later.' },
 });
 
-app.use('/api/auth',     authLimiter);
-app.use('/api/upload',   uploadLimiter);
-app.use('/api',          apiLimiter);
+// Tight limit on student lookup — prevents enumeration of valid identifiers
+const findLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,    // 5 minutes
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many lookup requests, please try again later.' },
+});
+
+app.use('/api/auth',              authLimiter);
+app.use('/api/upload',            uploadLimiter);
+app.use('/api/student-upload',    uploadLimiter);
+app.use('/api/student-meta',      apiLimiter);
+app.use('/api/students/find',     findLimiter);
+app.use('/api',                   apiLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));

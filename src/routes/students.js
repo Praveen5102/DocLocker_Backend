@@ -1,5 +1,5 @@
 const express = require('express');
-const { ROOT_FOLDER_ID, sanitize, listFolders, findFilesByName, findFolderByName, readJsonFile, trashFile } = require('../services/drive');
+const { ROOT_FOLDER_ID, sanitize, cleanFolderKey, listFolders, findFilesByName, findFolderByName, readJsonFile, trashFile } = require('../services/drive');
 const { verifyJWT, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 
@@ -60,9 +60,8 @@ router.get('/', verifyJWT, async (req, res) => {
 });
 
 // GET /api/students/find?identifier= — used by the student self-service portal
-// Returns ONLY the student's name and folder URL — never full PII.
-// The portal uses this to confirm the student exists so they can view their
-// own documents. Full metadata is never sent to unauthenticated callers.
+// Warm cache: email/phone field match (0 Drive calls).
+// Cold / new student: folder name suffix match (1 Drive call, 0 meta reads).
 router.get('/find', async (req, res) => {
   try {
     const { identifier } = req.query;
@@ -70,25 +69,41 @@ router.get('/find', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Missing or too-short identifier' });
     }
 
+    const safeId = identifier.trim().replace(/[^a-zA-Z0-9@._+-]/g, '');
+
+    // 1. Warm cache — full meta is already in memory, return it all
+    if (studentsCache.isValid()) {
+      const hit = studentsCache.data.find((s) => s.email === safeId || s.phone === safeId);
+      if (hit) {
+        // Spread full meta so the portal can pre-populate all fields on resume
+        return res.json({ success: true, student: { ...hit } });
+      }
+      // Not in warm cache (new student) — fall through to Drive scan
+    }
+
+    // 2. Cold / new student — match by folder name suffix (no meta reads for lookup)
+    // Try both @-preserved and sanitized suffix to handle folders created by different code paths
+    const suffix = `__${safeId}`;
+    const suffixSanitized = `__${safeId.replace(/[^a-zA-Z0-9 _\-.]/g, '_')}`;
     const folders = await listFolders(ROOT_FOLDER_ID());
-    const results = await Promise.all(
-      folders.map(async (folder) => {
-        try {
-          const metaFiles = await findMetaFile(folder.id);
-          if (metaFiles.length === 0) return null;
-          const meta = await readJsonFile(metaFiles[0].id);
-          if (meta.email === identifier || meta.phone === identifier) {
-            // Return only what the portal needs — no PII beyond the name
-            return { name: meta.name || folder.name, driveUrl: folder.webViewLink };
-          }
-        } catch (_) {}
-        return null;
-      })
+    const match = folders.find(
+      (f) => f.name && (f.name.endsWith(suffix) || f.name.endsWith(suffixSanitized))
     );
-    const match = results.find(Boolean);
-    // Constant-time-ish response shape regardless of found/not-found to
-    // prevent trivial enumeration via timing differences
-    res.json({ success: !!match, student: match || null });
+
+    if (match) {
+      const displayName = match.name.split('__')[0] || match.name;
+      let studentData = { name: displayName, driveUrl: match.webViewLink };
+      // Read meta so the portal gets the full picture on resume
+      try {
+        const metaFiles = await findMetaFile(match.id);
+        if (metaFiles.length > 0) {
+          const meta = await readJsonFile(metaFiles[0].id);
+          studentData = { driveUrl: match.webViewLink, ...meta, name: meta.name || displayName };
+        }
+      } catch (_) {}
+      return res.json({ success: true, student: studentData });
+    }
+    res.json({ success: false, student: null });
   } catch (err) {
     console.error('findStudent error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -101,7 +116,7 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
     const { studentName } = req.body;
     if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });
 
-    const safeName = sanitize(studentName);
+    const safeName = cleanFolderKey(studentName);
     const folders = await listFolders(ROOT_FOLDER_ID());
     const matches = folders.filter((f) => f.name === safeName);
     await Promise.all(matches.map((f) => trashFile(f.id)));

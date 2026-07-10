@@ -32,8 +32,16 @@ router.get('/:fileId/content', verifyJWTFlexible, async (req, res) => {
     }
 
     const { stream, mimeType, name } = await getFileContentStream(fileId);
+    const safeName = (name || 'file').replace(/[^\w.\-]/g, '_');
+
+    // Force attachment for executable/markup types to prevent stored XSS —
+    // an uploaded HTML or SVG file rendered inline would run in the admin's session.
+    const FORCE_ATTACHMENT = /^(text\/html|text\/javascript|application\/javascript|image\/svg\+xml|application\/xhtml\+xml)/i;
+    const disposition = (mode === 'download' || FORCE_ATTACHMENT.test(mimeType || '')) ? 'attachment' : 'inline';
+
     res.setHeader('Content-Type', mimeType || 'application/octet-stream');
-    res.setHeader('Content-Disposition', `${mode === 'download' ? 'attachment' : 'inline'}; filename="${name.replace(/"/g, '')}"`);
+    res.setHeader('Content-Disposition', `${disposition}; filename="${safeName}"`);
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     stream.on('error', () => res.status(500).end());
     stream.pipe(res);
   } catch (err) {

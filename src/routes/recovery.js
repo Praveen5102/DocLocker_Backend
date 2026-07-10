@@ -1,7 +1,7 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const {
-  ROOT_FOLDER_ID, sanitize, buildFolderKey, findFolderByName, findFilesByName, readFileBuffer,
+  ROOT_FOLDER_ID, sanitize, buildFolderKey, cleanFolderKey, findFolderByName, findFilesByName, readFileBuffer,
 } = require('../services/drive');
 const { readStudentMeta, writeStudentMeta } = require('../services/studentMeta');
 const { extractTextViaOcr } = require('../services/pdf');
@@ -93,7 +93,7 @@ Return JSON with this exact structure (include only non-null fields, but keep al
 // Returns { success: true, recovered: {...}, warning: "..." } — does NOT write yet.
 router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, res) => {
   try {
-    const folderKey = sanitize(buildFolderKey(req.params.studentKey, ''));
+    const folderKey = cleanFolderKey(req.params.studentKey);
     const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
     if (!stuDir) {
       return res.status(404).json({ success: false, error: `Student folder "${folderKey}" not found` });
@@ -173,7 +173,7 @@ router.post('/:studentKey/restore-meta', verifyJWT, requireStaff, async (req, re
     try { meta = typeof metaJson === 'string' ? JSON.parse(metaJson) : metaJson; }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
-    const folderKey = sanitize(buildFolderKey(req.params.studentKey, ''));
+    const folderKey = cleanFolderKey(req.params.studentKey);
     const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
     if (!stuDir) {
       return res.status(404).json({ success: false, error: `Student folder "${folderKey}" not found` });
