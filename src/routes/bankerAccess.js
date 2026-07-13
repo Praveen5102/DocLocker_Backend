@@ -9,7 +9,9 @@ const { studentsCache } = require('../services/cache');
 
 const router = express.Router();
 
-const VALID_LOAN_STATUSES = new Set(['pending', 'inprocess', 'sanctioned', 'rejected']);
+const VALID_LOAN_STATUSES = new Set(['pending', 'inprocess', 'sanctioned', 'rejected', 'dropped']);
+// Statuses that must carry an explanatory remark
+const REMARK_REQUIRED_STATUSES = new Set(['rejected', 'dropped']);
 
 // Internal files that should never be exposed to a banker, regardless of view.
 const EXCLUDED_FILENAMES = new Set(['student_meta.json', 'eligibility_report.pdf']);
@@ -89,8 +91,8 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
     if (!VALID_LOAN_STATUSES.has(loanStatus)) {
       return res.status(400).json({ success: false, error: `Invalid loanStatus. Must be one of: ${[...VALID_LOAN_STATUSES].join(', ')}` });
     }
-    if (loanStatus === 'rejected' && !String(loanRemark).trim()) {
-      return res.status(400).json({ success: false, error: 'loanRemark is required when status is rejected' });
+    if (REMARK_REQUIRED_STATUSES.has(loanStatus) && !String(loanRemark).trim()) {
+      return res.status(400).json({ success: false, error: `loanRemark is required when status is ${loanStatus}` });
     }
 
     const folderKey = sanitize(req.params.studentKey);
@@ -110,7 +112,7 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
     }
 
     meta.loanStatus = loanStatus;
-    meta.loanRemark = loanStatus === 'rejected' ? String(loanRemark).trim() : '';
+    meta.loanRemark = REMARK_REQUIRED_STATUSES.has(loanStatus) ? String(loanRemark).trim() : '';
     meta.loanStatusUpdatedBy = req.admin.name;
     meta.loanStatusUpdatedAt = new Date().toISOString();
 
