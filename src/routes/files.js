@@ -229,6 +229,74 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
   }
 });
 
+// POST /api/student-summary — student self-service summary + eligibility PDF (no JWT)
+// Mirrors staff /api/summary but validated by name + identifier, same as
+// student-upload/student-meta. This is the ONLY caller in practice — the
+// student portal generates its own summary PDF on every save — so it must
+// not require a staff JWT the student never has.
+// Body: { studentName, studentIdentifier, htmlContent, documents: [...parsedData] }
+router.post('/student-summary', async (req, res) => {
+  try {
+    const { studentName, studentIdentifier, htmlContent, documents = [] } = req.body;
+
+    if (!studentName || !studentName.trim()) {
+      return res.status(400).json({ success: false, error: 'Missing studentName' });
+    }
+    if (!studentIdentifier || studentIdentifier.trim().length < 5) {
+      return res.status(400).json({ success: false, error: 'Missing or invalid identifier' });
+    }
+    if (!htmlContent) {
+      return res.status(400).json({ success: false, error: 'Missing htmlContent' });
+    }
+
+    const dispName  = sanitize(studentName.trim());
+    const folderKey = buildFolderKey(dispName, studentIdentifier.trim());
+
+    // getOrCreate — folder should already exist (meta save runs first), but
+    // create it defensively so a summary save never fails on that alone.
+    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), folderKey);
+    const othersDir = await getOrCreate(stuDir.id, 'Others');
+
+    let eligHtml = null;
+    try { eligHtml = buildEligibilityHtml(dispName, documents); }
+    catch (e) { console.error('Eligibility HTML build failed:', e.message); }
+
+    const [summaryBuf, eligBuf] = await Promise.all([
+      convertHtmlToPdf(htmlContent, dispName),
+      eligHtml
+        ? convertHtmlToPdf(eligHtml, dispName + '_Elig')
+            .catch((e) => { console.error('Eligibility PDF convert failed:', e.message); return null; })
+        : Promise.resolve(null),
+      trashFilesByName(stuDir.id,    'Student_Summary.pdf'),
+      trashFilesByName(othersDir.id, 'Student_Summary.pdf'),
+      eligHtml ? trashFilesByName(stuDir.id,    'Eligibility_Report.pdf') : Promise.resolve(),
+      eligHtml ? trashFilesByName(othersDir.id, 'Eligibility_Report.pdf') : Promise.resolve(),
+    ]);
+
+    const [summaryUploaded, eligUpload] = await Promise.all([
+      uploadBuffer(othersDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf),
+      eligBuf
+        ? uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf)
+            .catch((e) => { console.error('Eligibility upload failed:', e.message); return null; })
+        : Promise.resolve(null),
+    ]);
+
+    const eligibilityReport = eligUpload
+      ? { fileId: eligUpload.id, webViewLink: eligUpload.webViewLink }
+      : null;
+
+    res.json({
+      success: true,
+      fileId: summaryUploaded.id,
+      webViewLink: summaryUploaded.webViewLink,
+      ...(eligibilityReport && { eligibilityReport }),
+    });
+  } catch (err) {
+    console.error('student-summary error:', err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 // POST /api/student-meta — student self-service meta save (no JWT)
 // Uses getOrCreate so it creates the folder for brand-new students too.
 router.post('/student-meta', async (req, res) => {
