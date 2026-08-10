@@ -178,6 +178,16 @@ async function trashFilesByName(parentId, name) {
   await Promise.all(files.map((f) => trashFile(f.id)));
 }
 
+// Permanently deletes a file or folder — bypasses Drive's Trash entirely.
+// For a folder, Drive cascades the delete to everything nested inside it, so
+// a student's whole tree (subfolders, documents, meta JSON) is removed in one
+// call. Unlike trashFile(), this is NOT recoverable and does not keep
+// counting against Drive storage quota — used for genuine hard-delete flows.
+async function deletePermanently(fileId) {
+  const drive = getDrive();
+  await drive.files.delete({ fileId });
+}
+
 async function createJsonFile(parentId, name, data) {
   const drive = getDrive();
   const content = JSON.stringify(data);
@@ -251,6 +261,7 @@ module.exports = {
   readFileBuffer,
   trashFile,
   trashFilesByName,
+  deletePermanently,
   createJsonFile,
   uploadBuffer,
   getFileMeta,

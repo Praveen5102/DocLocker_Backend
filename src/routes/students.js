@@ -1,5 +1,5 @@
 const express = require('express');
-const { ROOT_FOLDER_ID, sanitize, cleanFolderKey, listFolders, findFilesByName, findFolderByName, readJsonFile, trashFile } = require('../services/drive');
+const { ROOT_FOLDER_ID, cleanFolderKey, listFolders, findFilesByName, findFolderByName, readJsonFile, deletePermanently } = require('../services/drive');
 const { verifyJWT, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 
@@ -110,7 +110,13 @@ router.get('/find', async (req, res) => {
   }
 });
 
-// DELETE /api/students — delete student folder (staff only)
+// DELETE /api/students — permanently delete a student folder (staff only —
+// both superadmin and advisor pass requireStaff; only banker accounts are blocked).
+// Uses deletePermanently (hard delete), NOT trash — the previous version used
+// trashFile(), which only moved the folder into Drive's Trash: recoverable for
+// 30 days and still counted against storage quota, so the student's data was
+// never actually gone. Drive cascades a folder delete to everything nested
+// inside it (subfolders, documents, meta JSON) in one call.
 router.delete('/', verifyJWT, requireStaff, async (req, res) => {
   try {
     const { studentName } = req.body;
@@ -119,8 +125,17 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
     const safeName = cleanFolderKey(studentName);
     const folders = await listFolders(ROOT_FOLDER_ID());
     const matches = folders.filter((f) => f.name === safeName);
-    await Promise.all(matches.map((f) => trashFile(f.id)));
+    if (matches.length === 0) {
+      // Clear the cache anyway — a stale entry may be why the admin thinks
+      // this student still exists when the folder is already gone.
+      studentsCache.clear();
+      return res.json({ success: true, deleted: 0 });
+    }
 
+    await Promise.all(matches.map((f) => deletePermanently(f.id)));
+
+    // Clear immediately so no request — from this admin or any other admin/
+    // advisor session — can read a stale cached copy of the deleted student.
     studentsCache.clear();
     res.json({ success: true, deleted: matches.length });
   } catch (err) {
