@@ -112,15 +112,40 @@ router.get('/find', async (req, res) => {
 
 // DELETE /api/students — permanently delete a student folder (staff only —
 // both superadmin and advisor pass requireStaff; only banker accounts are blocked).
-// Uses deletePermanently (hard delete), NOT trash — the previous version used
-// trashFile(), which only moved the folder into Drive's Trash: recoverable for
-// 30 days and still counted against storage quota, so the student's data was
-// never actually gone. Drive cascades a folder delete to everything nested
-// inside it (subfolders, documents, meta JSON) in one call.
+// Uses deletePermanently (hard delete), NOT trash — trashFile() only moves the
+// folder into Drive's Trash: recoverable for 30 days and still counted against
+// storage quota, so the student's data was never actually gone.
+//
+// Preferred path: delete by folderId (the exact Drive folder the admin is
+// looking at, extracted client-side from the student's driveUrl). This is
+// unambiguous — no string reconstruction involved.
+//
+// Fallback path (folderId not supplied — older clients): reconstruct the
+// folder name from studentName and match by exact string. This is fragile —
+// whitespace/casing drift between what's typed and what's on Drive, or a
+// folder created under an older naming scheme, means zero folders match.
+// Previously that case returned `{ success: true, deleted: 0 }`, so the
+// frontend treated it as a successful delete and removed the row from view
+// even though nothing was removed from Drive — the student reappeared on
+// the next refresh. Now it's a 404, so the caller knows the delete did not
+// happen and must not remove the row from its own list.
 router.delete('/', verifyJWT, requireStaff, async (req, res) => {
   try {
-    const { studentName } = req.body;
-    if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });
+    const { studentName, folderId } = req.body;
+
+    if (folderId) {
+      try {
+        await deletePermanently(folderId);
+      } catch (err) {
+        // Already gone (e.g. a duplicate delete click) — treat as success.
+        const status = err.code || err.response?.status;
+        if (status !== 404) throw err;
+      }
+      studentsCache.clear();
+      return res.json({ success: true, deleted: 1 });
+    }
+
+    if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName or folderId' });
 
     const safeName = cleanFolderKey(studentName);
     const folders = await listFolders(ROOT_FOLDER_ID());
@@ -129,7 +154,10 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
       // Clear the cache anyway — a stale entry may be why the admin thinks
       // this student still exists when the folder is already gone.
       studentsCache.clear();
-      return res.json({ success: true, deleted: 0 });
+      return res.status(404).json({
+        success: false,
+        error: `No Drive folder matched "${safeName}" — nothing was deleted. Refresh the list and try again.`,
+      });
     }
 
     await Promise.all(matches.map((f) => deletePermanently(f.id)));
