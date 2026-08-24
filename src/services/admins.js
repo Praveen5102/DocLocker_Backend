@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const { ROOT_FOLDER_ID, findFilesByName, readJsonFile, trashFilesByName, createJsonFile } = require('./drive');
+const { ROOT_FOLDER_ID, findFilesByName, readJsonFile, trashFilesByNameExcept, createJsonFile } = require('./drive');
 
 const BCRYPT_ROUNDS = 12;
 
@@ -42,9 +42,15 @@ async function readAdminsFile() {
   }
 }
 
+// Writes the new admins.json FIRST, then trashes the old copy excluding the
+// new file. This used to trash-then-create: if createJsonFile failed right
+// after the old file was trashed (network blip, Drive hiccup), the entire
+// admin/advisor/banker roster — every account and password hash — would
+// simply be gone. Writing first means a failed cleanup leaves a harmless
+// duplicate, never a wiped roster.
 async function writeAdminsFile(data) {
-  await trashFilesByName(ROOT_FOLDER_ID(), 'admins.json');
-  await createJsonFile(ROOT_FOLDER_ID(), 'admins.json', data);
+  const newFile = await createJsonFile(ROOT_FOLDER_ID(), 'admins.json', data);
+  await trashFilesByNameExcept(ROOT_FOLDER_ID(), 'admins.json', newFile.id);
 }
 
 module.exports = { hashPassword, verifyPassword, readAdminsFile, writeAdminsFile };

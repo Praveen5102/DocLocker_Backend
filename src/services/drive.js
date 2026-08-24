@@ -54,21 +54,49 @@ function escapeQ(str) {
   return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+// Serializes getOrCreate calls for the same (parentId, name) pair within this
+// process. Drive has no atomic "create if not exists" — getOrCreate is a
+// classic check-then-act: list, see nothing, create. Two calls arriving close
+// together (a student double-clicking submit, a slow network prompting a
+// retry, two upload requests firing in quick succession) can both pass the
+// "no folder yet" check before either creates one, leaving TWO Drive folders
+// with the identical name — a duplicate student record that then behaves
+// inconsistently (uploads split across two folders, one looking incomplete).
+// This lock closes that race for calls handled by this process. It does NOT
+// coordinate across multiple server instances — this app already assumes a
+// single instance elsewhere (studentsCache/advisorsCache are plain in-memory
+// with no shared backing store).
+const _createLocks = new Map();
+
 async function getOrCreate(parentId, name) {
-  const drive = getDrive();
   const safeName = sanitize(name);
-  const res = await drive.files.list({
-    q: `name = '${escapeQ(safeName)}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
-    fields: 'files(id, name)',
-    spaces: 'drive',
-    pageSize: 5,
-  });
-  if (res.data.files.length > 0) return res.data.files[0];
-  const created = await drive.files.create({
-    requestBody: { name: safeName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
-    fields: 'id, name',
-  });
-  return created.data;
+  const lockKey = `${parentId}::${safeName}`;
+
+  const existing = _createLocks.get(lockKey);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const drive = getDrive();
+    const res = await drive.files.list({
+      q: `name = '${escapeQ(safeName)}' and '${parentId}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      fields: 'files(id, name)',
+      spaces: 'drive',
+      pageSize: 5,
+    });
+    if (res.data.files.length > 0) return res.data.files[0];
+    const created = await drive.files.create({
+      requestBody: { name: safeName, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
+      fields: 'id, name',
+    });
+    return created.data;
+  })();
+
+  _createLocks.set(lockKey, task);
+  try {
+    return await task;
+  } finally {
+    _createLocks.delete(lockKey);
+  }
 }
 
 // Read-only lookup — unlike getOrCreate, never creates the folder as a side effect.
@@ -140,11 +168,17 @@ async function listAllFilesRecursive(rootFolderId, relativePath = '') {
   return all;
 }
 
+// Ordered newest-first (orderBy: createdTime desc) so callers that take
+// files[0] as "the" file always get the most recently written one, even if
+// an old duplicate is still sitting around (e.g. a cleanup step that failed
+// after a new file was already written) — a stale read here would otherwise
+// look exactly like lost/reverted data to whoever wrote the latest version.
 async function findFilesByName(parentId, name) {
   const drive = getDrive();
   const res = await drive.files.list({
     q: `name = '${escapeQ(name)}' and '${parentId}' in parents and trashed = false`,
-    fields: 'files(id, name)',
+    fields: 'files(id, name, createdTime)',
+    orderBy: 'createdTime desc',
     spaces: 'drive',
     pageSize: 10,
   });
@@ -176,6 +210,16 @@ async function trashFile(fileId) {
 async function trashFilesByName(parentId, name) {
   const files = await findFilesByName(parentId, name);
   await Promise.all(files.map((f) => trashFile(f.id)));
+}
+
+// Same as trashFilesByName, but never trashes exceptId. Used after uploading
+// a replacement file that shares its old name with the version(s) being
+// cleaned up — trashing "everything named X" without this exclusion would
+// trash the brand-new file too, since Drive allows duplicate names and a
+// plain name-match query can't otherwise tell them apart.
+async function trashFilesByNameExcept(parentId, name, exceptId) {
+  const files = await findFilesByName(parentId, name);
+  await Promise.all(files.filter((f) => f.id !== exceptId).map((f) => trashFile(f.id)));
 }
 
 // Permanently deletes a file or folder — bypasses Drive's Trash entirely.
@@ -261,6 +305,7 @@ module.exports = {
   readFileBuffer,
   trashFile,
   trashFilesByName,
+  trashFilesByNameExcept,
   deletePermanently,
   createJsonFile,
   uploadBuffer,

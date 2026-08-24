@@ -2,11 +2,12 @@ const express = require('express');
 const multer  = require('multer');
 const {
   ROOT_FOLDER_ID, sanitize, buildFolderKey, cleanFolderKey, folderKeyDisplayName,
-  getOrCreate, findFolderByName, trashFilesByName, uploadBuffer, createJsonFile,
+  getOrCreate, findFolderByName, trashFilesByNameExcept, uploadBuffer,
 } = require('../services/drive');
 const { convertToPdf, convertHtmlToPdf } = require('../services/pdf');
 const { parseDocument }                  = require('../services/documentParser');
 const { buildEligibilityHtml }           = require('../services/eligibilityReport');
+const { writeStudentMeta }               = require('../services/studentMeta');
 const { studentsCache }                  = require('../services/cache');
 const { verifyJWT, requireStaff }        = require('../middleware/auth');
 
@@ -34,17 +35,20 @@ router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (re
       convertToPdf(file.buffer, file.mimetype, cleanNameNoExt),
     ]);
 
-    // Trash old versions while we prepare final file details
-    await Promise.all([
-      trashFilesByName(subDir.id, fileName),
-      trashFilesByName(subDir.id, cleanNameNoExt + '.pdf'),
-    ]);
-
     let finalBuffer   = pdfBuffer || file.buffer;
     let finalMimeType = pdfBuffer ? 'application/pdf' : file.mimetype;
     let finalFileName = pdfBuffer ? (cleanNameNoExt + '.pdf') : fileName;
 
+    // Upload the new file FIRST, then clean up old versions — excluding the
+    // file we just uploaded, since it always shares one of the two names
+    // being cleaned up. Trashing old copies before the upload risked leaving
+    // the student with NO document at all if the upload step then failed.
     const uploaded = await uploadBuffer(subDir.id, finalFileName, finalMimeType, finalBuffer);
+
+    await Promise.all([
+      trashFilesByNameExcept(subDir.id, fileName, uploaded.id),
+      trashFilesByNameExcept(subDir.id, cleanNameNoExt + '.pdf', uploaded.id),
+    ]);
 
     let parsedData = null;
     if (extractedText) {
@@ -69,15 +73,8 @@ router.post('/meta', verifyJWT, requireStaff, async (req, res) => {
     try { metaObj = JSON.parse(metaJson); }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
-    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
-    const othersDir = await getOrCreate(stuDir.id, 'Others');
-
-    // Trash old copies (root-level legacy + Others/) in parallel before writing new one
-    await Promise.all([
-      trashFilesByName(stuDir.id,    'student_meta.json'),
-      trashFilesByName(othersDir.id, 'student_meta.json'),
-    ]);
-    const file = await createJsonFile(othersDir.id, 'student_meta.json', metaObj);
+    const stuDir = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
+    const file   = await writeStudentMeta(stuDir.id, metaObj);
 
     studentsCache.clear();
     res.json({ success: true, fileId: file.id });
@@ -104,27 +101,31 @@ router.post('/summary', verifyJWT, requireStaff, async (req, res) => {
     try { eligHtml = buildEligibilityHtml(dispName, documents); }
     catch (e) { console.error('Eligibility HTML build failed:', e.message); }
 
-    // All trash operations + both PDF conversions in parallel.
-    // Uploads happen after this Promise.all so every trash is done before any upload.
+    // Convert both PDFs concurrently — no Drive writes yet, nothing to lose here.
     const [summaryBuf, eligBuf] = await Promise.all([
       convertHtmlToPdf(htmlContent, dispName),
       eligHtml
         ? convertHtmlToPdf(eligHtml, dispName + '_Elig')
             .catch((e) => { console.error('Eligibility PDF convert failed:', e.message); return null; })
         : Promise.resolve(null),
-      trashFilesByName(stuDir.id,    'Student_Summary.pdf'),
-      trashFilesByName(othersDir.id, 'Student_Summary.pdf'),
-      eligHtml ? trashFilesByName(stuDir.id,    'Eligibility_Report.pdf') : Promise.resolve(),
-      eligHtml ? trashFilesByName(othersDir.id, 'Eligibility_Report.pdf') : Promise.resolve(),
     ]);
 
-    // Upload both in parallel
+    // Upload both new PDFs FIRST, then clean up old copies — excluding the
+    // new files — so a failed cleanup step never leaves the student without
+    // a summary (previously trashed old copies before uploading the new one).
     const [summaryUploaded, eligUpload] = await Promise.all([
       uploadBuffer(othersDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf),
       eligBuf
         ? uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf)
             .catch((e) => { console.error('Eligibility upload failed:', e.message); return null; })
         : Promise.resolve(null),
+    ]);
+
+    await Promise.all([
+      trashFilesByNameExcept(stuDir.id,    'Student_Summary.pdf', summaryUploaded.id),
+      trashFilesByNameExcept(othersDir.id, 'Student_Summary.pdf', summaryUploaded.id),
+      eligUpload ? trashFilesByNameExcept(stuDir.id,    'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
+      eligUpload ? trashFilesByNameExcept(othersDir.id, 'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
     ]);
 
     const eligibilityReport = eligUpload
@@ -154,14 +155,14 @@ router.post('/eligibility-report', verifyJWT, requireStaff, async (req, res) => 
     const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
     const othersDir = await getOrCreate(stuDir.id, 'Others');
     const html      = buildEligibilityHtml(dispName, documents);
+    const pdfBuf    = await convertHtmlToPdf(html, dispName + '_Elig');
 
-    // Trash old copies and convert in parallel
-    const [pdfBuf] = await Promise.all([
-      convertHtmlToPdf(html, dispName + '_Elig'),
-      trashFilesByName(stuDir.id,    'Eligibility_Report.pdf'),
-      trashFilesByName(othersDir.id, 'Eligibility_Report.pdf'),
-    ]);
+    // Upload first, then clean up old copies excluding the new file.
     const uploaded = await uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', pdfBuf);
+    await Promise.all([
+      trashFilesByNameExcept(stuDir.id,    'Eligibility_Report.pdf', uploaded.id),
+      trashFilesByNameExcept(othersDir.id, 'Eligibility_Report.pdf', uploaded.id),
+    ]);
 
     res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink });
   } catch (err) {
@@ -205,16 +206,19 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
 
     const subDir = await getOrCreate(stuDir.id, sanitize(subFolder.trim()));
 
-    await Promise.all([
-      trashFilesByName(subDir.id, fileName),
-      trashFilesByName(subDir.id, cleanNameNoExt + '.pdf'),
-    ]);
-
     const finalBuffer   = pdfBuffer || file.buffer;
     const finalMimeType = pdfBuffer ? 'application/pdf' : file.mimetype;
     const finalFileName = pdfBuffer ? (cleanNameNoExt + '.pdf') : fileName;
 
+    // Upload the new file FIRST, then clean up old versions excluding it —
+    // a student's document must never disappear because a retry/failure hit
+    // between "trash the old one" and "upload the new one."
     const uploaded = await uploadBuffer(subDir.id, finalFileName, finalMimeType, finalBuffer);
+
+    await Promise.all([
+      trashFilesByNameExcept(subDir.id, fileName, uploaded.id),
+      trashFilesByNameExcept(subDir.id, cleanNameNoExt + '.pdf', uploaded.id),
+    ]);
 
     let parsedData = null;
     if (extractedText) {
@@ -267,18 +271,22 @@ router.post('/student-summary', async (req, res) => {
         ? convertHtmlToPdf(eligHtml, dispName + '_Elig')
             .catch((e) => { console.error('Eligibility PDF convert failed:', e.message); return null; })
         : Promise.resolve(null),
-      trashFilesByName(stuDir.id,    'Student_Summary.pdf'),
-      trashFilesByName(othersDir.id, 'Student_Summary.pdf'),
-      eligHtml ? trashFilesByName(stuDir.id,    'Eligibility_Report.pdf') : Promise.resolve(),
-      eligHtml ? trashFilesByName(othersDir.id, 'Eligibility_Report.pdf') : Promise.resolve(),
     ]);
 
+    // Upload the new PDFs FIRST, then clean up old copies excluding them.
     const [summaryUploaded, eligUpload] = await Promise.all([
       uploadBuffer(othersDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf),
       eligBuf
         ? uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf)
             .catch((e) => { console.error('Eligibility upload failed:', e.message); return null; })
         : Promise.resolve(null),
+    ]);
+
+    await Promise.all([
+      trashFilesByNameExcept(stuDir.id,    'Student_Summary.pdf', summaryUploaded.id),
+      trashFilesByNameExcept(othersDir.id, 'Student_Summary.pdf', summaryUploaded.id),
+      eligUpload ? trashFilesByNameExcept(stuDir.id,    'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
+      eligUpload ? trashFilesByNameExcept(othersDir.id, 'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
     ]);
 
     const eligibilityReport = eligUpload
@@ -319,16 +327,11 @@ router.post('/student-meta', async (req, res) => {
 
     const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
 
-    // getOrCreate — creates the root student folder for first-time students
-    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), folderKey);
-    const othersDir = await getOrCreate(stuDir.id, 'Others');
-
-    // Trash old copies in parallel before writing new one
-    await Promise.all([
-      trashFilesByName(stuDir.id,    'student_meta.json'),
-      trashFilesByName(othersDir.id, 'student_meta.json'),
-    ]);
-    await createJsonFile(othersDir.id, 'student_meta.json', metaObj);
+    // getOrCreate — creates the root student folder for first-time students.
+    // Locked internally against the double-submit race that used to create
+    // duplicate student folders for the same registration.
+    const stuDir = await getOrCreate(ROOT_FOLDER_ID(), folderKey);
+    await writeStudentMeta(stuDir.id, metaObj);
 
     studentsCache.clear();
     res.json({ success: true });
