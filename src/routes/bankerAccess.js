@@ -9,9 +9,28 @@ const { studentsCache } = require('../services/cache');
 
 const router = express.Router();
 
-const VALID_LOAN_STATUSES = new Set(['pending', 'inprocess', 'sanctioned', 'rejected', 'dropped']);
+const VALID_LOAN_STATUSES = new Set(['pending', 'inprocess', 'sanctioned', 'rejected', 'dropped', 'disbursed']);
 // Statuses that must carry an explanatory remark
 const REMARK_REQUIRED_STATUSES = new Set(['rejected', 'dropped']);
+
+// Disbursement figures that must be recorded when a loan moves to "disbursed" —
+// mirrors DISBURSEMENT_FIELDS in the frontend loan status modals.
+const DISBURSEMENT_FIELDS = ['processingFee', 'interestRate', 'loanAmount', 'tenureMonths', 'insuranceAmount'];
+
+function validateDisbursement(disbursement) {
+  if (!disbursement || typeof disbursement !== 'object') {
+    return { error: `disbursement details are required when status is disbursed (expected: ${DISBURSEMENT_FIELDS.join(', ')})` };
+  }
+  const values = {};
+  for (const field of DISBURSEMENT_FIELDS) {
+    const n = Number(disbursement[field]);
+    if (disbursement[field] === undefined || disbursement[field] === '' || Number.isNaN(n) || n < 0) {
+      return { error: `disbursement.${field} must be a non-negative number` };
+    }
+    values[field] = n;
+  }
+  return { values };
+}
 
 // Internal files that should never be exposed to a banker, regardless of view.
 const EXCLUDED_FILENAMES = new Set(['student_meta.json', 'eligibility_report.pdf']);
@@ -86,13 +105,19 @@ router.get('/:studentKey/files', verifyJWT, async (req, res) => {
 // All authenticated roles. Bankers may only update students they have access to.
 router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
   try {
-    const { loanStatus, loanRemark = '' } = req.body;
+    const { loanStatus, loanRemark = '', disbursement } = req.body;
 
     if (!VALID_LOAN_STATUSES.has(loanStatus)) {
       return res.status(400).json({ success: false, error: `Invalid loanStatus. Must be one of: ${[...VALID_LOAN_STATUSES].join(', ')}` });
     }
     if (REMARK_REQUIRED_STATUSES.has(loanStatus) && !String(loanRemark).trim()) {
       return res.status(400).json({ success: false, error: `loanRemark is required when status is ${loanStatus}` });
+    }
+    let disbursementValues = null;
+    if (loanStatus === 'disbursed') {
+      const { values, error } = validateDisbursement(disbursement);
+      if (error) return res.status(400).json({ success: false, error });
+      disbursementValues = values;
     }
 
     const folderKey = sanitize(req.params.studentKey);
@@ -115,11 +140,15 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
     meta.loanRemark = REMARK_REQUIRED_STATUSES.has(loanStatus) ? String(loanRemark).trim() : '';
     meta.loanStatusUpdatedBy = req.admin.name;
     meta.loanStatusUpdatedAt = new Date().toISOString();
+    // Only overwritten when a new disbursal is recorded — an older disbursement
+    // record is left in place if the status is later moved off "disbursed",
+    // so it still shows as history rather than disappearing.
+    if (disbursementValues) meta.loanDisbursement = disbursementValues;
 
     await writeStudentMeta(stuDir.id, meta);
     studentsCache.clear();
 
-    res.json({ success: true, loanStatus: meta.loanStatus, loanRemark: meta.loanRemark });
+    res.json({ success: true, loanStatus: meta.loanStatus, loanRemark: meta.loanRemark, loanDisbursement: meta.loanDisbursement || null });
   } catch (err) {
     console.error('loanStatus update error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
