@@ -238,10 +238,21 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
 // student-upload/student-meta. This is the ONLY caller in practice — the
 // student portal generates its own summary PDF on every save — so it must
 // not require a staff JWT the student never has.
-// Body: { studentName, studentIdentifier, htmlContent, documents: [...parsedData] }
-router.post('/student-summary', async (req, res) => {
+//
+// The summary PDF itself now arrives pre-rendered as a real file (multipart
+// field "summaryPdf") — summaryGenerator.js builds it client-side with
+// html2canvas + jsPDF so it can use real CSS (grid/flexbox/gradients/custom
+// properties), none of which survive the convertHtmlToPdf() pipeline below
+// (a Google Docs HTML import, not a browser engine). The eligibility report
+// alongside it is unaffected — it's simple enough to stay on that pipeline.
+// Body (multipart/form-data): studentName, studentIdentifier,
+// documents (JSON-encoded [...parsedData]), summaryPdf (file)
+router.post('/student-summary', upload.single('summaryPdf'), async (req, res) => {
   try {
-    const { studentName, studentIdentifier, htmlContent, documents = [] } = req.body;
+    const { studentName, studentIdentifier } = req.body;
+    let documents = [];
+    try { documents = req.body.documents ? JSON.parse(req.body.documents) : []; }
+    catch (_) { documents = []; }
 
     if (!studentName || !studentName.trim()) {
       return res.status(400).json({ success: false, error: 'Missing studentName' });
@@ -249,8 +260,8 @@ router.post('/student-summary', async (req, res) => {
     if (!studentIdentifier || studentIdentifier.trim().length < 5) {
       return res.status(400).json({ success: false, error: 'Missing or invalid identifier' });
     }
-    if (!htmlContent) {
-      return res.status(400).json({ success: false, error: 'Missing htmlContent' });
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'Missing summaryPdf' });
     }
 
     const dispName  = sanitize(studentName.trim());
@@ -266,7 +277,7 @@ router.post('/student-summary', async (req, res) => {
     catch (e) { console.error('Eligibility HTML build failed:', e.message); }
 
     const [summaryBuf, eligBuf] = await Promise.all([
-      convertHtmlToPdf(htmlContent, dispName),
+      Promise.resolve(req.file.buffer),
       eligHtml
         ? convertHtmlToPdf(eligHtml, dispName + '_Elig')
             .catch((e) => { console.error('Eligibility PDF convert failed:', e.message); return null; })
