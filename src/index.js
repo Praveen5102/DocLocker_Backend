@@ -32,6 +32,7 @@ const filesRoutes       = require('./routes/files');
 const bankerAccessRoutes = require('./routes/bankerAccess');
 const fileProxyRoutes   = require('./routes/fileProxy');
 const recoveryRoutes    = require('./routes/recovery');
+const auditRoutes       = require('./routes/audit');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -126,6 +127,7 @@ app.use('/api/students', studentsRoutes);
 app.use('/api/students', bankerAccessRoutes);
 app.use('/api/students', recoveryRoutes);
 app.use('/api/files',    fileProxyRoutes);
+app.use('/api/audit',    auditRoutes);
 app.use('/api',          filesRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────

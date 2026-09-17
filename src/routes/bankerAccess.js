@@ -6,6 +6,7 @@ const {
 const { readStudentMeta, writeStudentMeta } = require('../services/studentMeta');
 const { verifyJWT, verifyJWTFlexible, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
+const { logAudit } = require('../services/auditLog');
 
 const router = express.Router();
 
@@ -58,6 +59,11 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
 
     await writeStudentMeta(stuDir.id, meta);
     studentsCache.clear();
+    logAudit({
+      actor: req.admin.name, role: req.admin.role,
+      action: grant ? 'banker_access.grant' : 'banker_access.revoke',
+      target: folderKey, details: { banker: bankerName },
+    });
     res.json({ success: true, sharedBankers: meta.sharedBankers });
   } catch (err) {
     console.error('bankerAccess error:', err.message);
@@ -147,6 +153,11 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
 
     await writeStudentMeta(stuDir.id, meta);
     studentsCache.clear();
+
+    logAudit({
+      actor: req.admin.name, role: req.admin.role, action: 'loan_status.update', target: folderKey,
+      details: { loanStatus, ...(disbursementValues ? { disbursement: disbursementValues } : {}) },
+    });
 
     res.json({ success: true, loanStatus: meta.loanStatus, loanRemark: meta.loanRemark, loanDisbursement: meta.loanDisbursement || null });
   } catch (err) {

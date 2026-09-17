@@ -177,7 +177,7 @@ async function findFilesByName(parentId, name) {
   const drive = getDrive();
   const res = await drive.files.list({
     q: `name = '${escapeQ(name)}' and '${parentId}' in parents and trashed = false`,
-    fields: 'files(id, name, createdTime)',
+    fields: 'files(id, name, createdTime, modifiedTime)',
     orderBy: 'createdTime desc',
     spaces: 'drive',
     pageSize: 10,

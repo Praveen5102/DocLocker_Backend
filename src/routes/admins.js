@@ -2,6 +2,7 @@ const express = require('express');
 const { hashPassword, verifyPassword, readAdminsFile, writeAdminsFile } = require('../services/admins');
 const { verifyJWT, requireSuperAdmin, requireStaff } = require('../middleware/auth');
 const { advisorsCache } = require('../services/cache');
+const { logAudit } = require('../services/auditLog');
 
 const router = express.Router();
 
@@ -68,6 +69,7 @@ router.post('/', verifyJWT, requireStaff, async (req, res) => {
     data.admins.push(record);
     await writeAdminsFile(data);
     advisorsCache.clear();
+    logAudit({ actor: req.admin.name, role: req.admin.role, action: 'admin.create', target: name, details: { role } });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -94,6 +96,7 @@ router.delete('/:name', verifyJWT, requireStaff, async (req, res) => {
     data.admins = data.admins.filter((a) => a.name !== targetName);
     await writeAdminsFile(data);
     advisorsCache.clear();
+    logAudit({ actor: req.admin.name, role: req.admin.role, action: 'admin.delete', target: targetName, details: { role: target.role } });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -121,6 +124,7 @@ router.put('/:name/reset-password', verifyJWT, requireStaff, async (req, res) =>
 
     target.passwordHash = await hashPassword(newPassword);
     await writeAdminsFile(data);
+    logAudit({ actor: req.admin.name, role: req.admin.role, action: 'admin.reset_password', target: targetName });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -149,6 +153,7 @@ router.put('/password', verifyJWT, async (req, res) => {
 
     admin.passwordHash = await hashPassword(newPassword);
     await writeAdminsFile(data);
+    logAudit({ actor: req.admin.name, role: req.admin.role, action: 'admin.change_own_password', target: req.admin.name });
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ success: false, error: 'Internal server error' });

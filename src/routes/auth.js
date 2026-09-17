@@ -1,6 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { hashPassword, verifyPassword, readAdminsFile, writeAdminsFile } = require('../services/admins');
+const { logAudit } = require('../services/auditLog');
 
 const router = express.Router();
 
@@ -39,6 +40,8 @@ router.post('/login', async (req, res) => {
       admin.passwordHash = await hashPassword(password);
       await writeAdminsFile(data);
     }
+
+    logAudit({ actor: admin.name, role: admin.role, action: 'auth.login', target: admin.name });
 
     res.json({
       success: true,

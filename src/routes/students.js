@@ -2,6 +2,7 @@ const express = require('express');
 const { ROOT_FOLDER_ID, cleanFolderKey, listFolders, findFilesByName, findFolderByName, readJsonFile, deletePermanently } = require('../services/drive');
 const { verifyJWT, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
+const { logAudit } = require('../services/auditLog');
 
 const router = express.Router();
 
@@ -35,11 +36,15 @@ router.get('/', verifyJWT, async (req, res) => {
           const obj = { name: folder.name, driveUrl: folder.webViewLink };
           const metaFiles = await findMetaFile(folder.id);
           if (metaFiles.length > 0) {
+            // Drive's own file modifiedTime — a genuine "last updated" stamp
+            // for the row, not something read from (and possibly stale
+            // inside) the meta JSON's own content.
+            const updatedAt = metaFiles[0].modifiedTime || null;
             try {
               const meta = await readJsonFile(metaFiles[0].id);
-              return { ...obj, ...meta };
+              return { ...obj, ...meta, updatedAt };
             } catch (err) {
-              return { ...obj, _parseError: err.message };
+              return { ...obj, _parseError: err.message, updatedAt };
             }
           }
           return obj;
@@ -142,6 +147,7 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
         if (status !== 404) throw err;
       }
       studentsCache.clear();
+      logAudit({ actor: req.admin.name, role: req.admin.role, action: 'student.delete', target: studentName || folderId });
       return res.json({ success: true, deleted: 1 });
     }
 
@@ -165,6 +171,7 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
     // Clear immediately so no request — from this admin or any other admin/
     // advisor session — can read a stale cached copy of the deleted student.
     studentsCache.clear();
+    logAudit({ actor: req.admin.name, role: req.admin.role, action: 'student.delete', target: safeName, details: { count: matches.length } });
     res.json({ success: true, deleted: matches.length });
   } catch (err) {
     console.error('deleteStudent error:', err.message);
