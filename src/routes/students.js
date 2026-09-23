@@ -9,16 +9,27 @@ const router = express.Router();
 // student_meta.json now lives in the "Others" subfolder; older students may still
 // have it sitting at the folder root from before this change, so check both —
 // in parallel, to avoid doubling/tripling per-folder Drive round trips.
+// The auto-generated Student_Summary.pdf / Eligibility_Report.pdf live in that
+// same "Others" folder, so their lookup piggybacks on this same round trip
+// instead of costing the list view a second Drive call per student.
 async function findMetaFile(folderId) {
   const [othersDir, rootFiles] = await Promise.all([
     findFolderByName(folderId, 'Others'),
     findFilesByName(folderId, 'student_meta.json'),
   ]);
-  if (othersDir) {
-    const inOthers = await findFilesByName(othersDir.id, 'student_meta.json');
-    if (inOthers.length > 0) return inOthers;
+  if (!othersDir) {
+    return { metaFiles: rootFiles, summaryFile: null, eligibilityFile: null };
   }
-  return rootFiles;
+  const [inOthers, summaryFiles, eligibilityFiles] = await Promise.all([
+    findFilesByName(othersDir.id, 'student_meta.json'),
+    findFilesByName(othersDir.id, 'Student_Summary.pdf'),
+    findFilesByName(othersDir.id, 'Eligibility_Report.pdf'),
+  ]);
+  return {
+    metaFiles: inOthers.length > 0 ? inOthers : rootFiles,
+    summaryFile: summaryFiles[0] || null,
+    eligibilityFile: eligibilityFiles[0] || null,
+  };
 }
 
 // GET /api/students — list all (JWT required)
@@ -34,7 +45,13 @@ router.get('/', verifyJWT, async (req, res) => {
       students = await Promise.all(
         folders.map(async (folder) => {
           const obj = { name: folder.name, driveUrl: folder.webViewLink };
-          const metaFiles = await findMetaFile(folder.id);
+          const { metaFiles, summaryFile, eligibilityFile } = await findMetaFile(folder.id);
+          const summaryPdf = summaryFile
+            ? { fileId: summaryFile.id, webViewLink: summaryFile.webViewLink, updatedAt: summaryFile.modifiedTime }
+            : null;
+          const eligibilityPdf = eligibilityFile
+            ? { fileId: eligibilityFile.id, webViewLink: eligibilityFile.webViewLink, updatedAt: eligibilityFile.modifiedTime }
+            : null;
           if (metaFiles.length > 0) {
             // Drive's own file modifiedTime — a genuine "last updated" stamp
             // for the row, not something read from (and possibly stale
@@ -42,12 +59,12 @@ router.get('/', verifyJWT, async (req, res) => {
             const updatedAt = metaFiles[0].modifiedTime || null;
             try {
               const meta = await readJsonFile(metaFiles[0].id);
-              return { ...obj, ...meta, updatedAt };
+              return { ...obj, ...meta, updatedAt, summaryPdf, eligibilityPdf };
             } catch (err) {
-              return { ...obj, _parseError: err.message, updatedAt };
+              return { ...obj, _parseError: err.message, updatedAt, summaryPdf, eligibilityPdf };
             }
           }
-          return obj;
+          return { ...obj, summaryPdf, eligibilityPdf };
         })
       );
       studentsCache.set(students);
@@ -100,7 +117,7 @@ router.get('/find', async (req, res) => {
       let studentData = { name: displayName, driveUrl: match.webViewLink };
       // Read meta so the portal gets the full picture on resume
       try {
-        const metaFiles = await findMetaFile(match.id);
+        const { metaFiles } = await findMetaFile(match.id);
         if (metaFiles.length > 0) {
           const meta = await readJsonFile(metaFiles[0].id);
           studentData = { driveUrl: match.webViewLink, ...meta, name: meta.name || displayName };
