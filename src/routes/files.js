@@ -10,9 +10,21 @@ const { buildEligibilityHtml }           = require('../services/eligibilityRepor
 const { writeStudentMeta }               = require('../services/studentMeta');
 const { studentsCache }                  = require('../services/cache');
 const { verifyJWT, requireStaff }        = require('../middleware/auth');
+const { logAudit }                       = require('../services/auditLog');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+// Canonical audit target for a student — matches bankerAccess.js's own
+// sanitize(buildFolderKey(...)) exactly, computed fresh from the raw name/
+// identifier every time (never reused from a route's own pre-sanitized
+// folderKey variable, which can legally differ char-for-char — e.g. an
+// email identifier's "@" survives buildFolderKey's own filter but not this
+// outer sanitize()) so every audit entry's target lines up with the Admin
+// dashboard's own reconstruction of it from student.name/email/phone.
+function auditTargetFor(studentName, studentIdentifier) {
+  return sanitize(buildFolderKey((studentName || '').trim(), (studentIdentifier || '').trim()));
+}
 
 // POST /api/upload
 // Returns parsedData in response — frontend holds this, no JSON saved to Drive
@@ -226,6 +238,11 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
       parsedData = { type: parsed.type, subFolder: sanitize(subFolder), sourceFile: finalFileName, fields: parsed.fields };
     }
 
+    logAudit({
+      actor: sanitize(studentName.trim()), role: 'student', action: 'document.upload',
+      target: auditTargetFor(studentName, studentIdentifier), details: { subFolder: sanitize(subFolder), fileName: uploaded.name },
+    });
+
     res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink, fileName: uploaded.name, parsedData });
   } catch (err) {
     console.error('student-upload error:', err.message);
@@ -304,6 +321,11 @@ router.post('/student-summary', upload.single('summaryPdf'), async (req, res) =>
       ? { fileId: eligUpload.id, webViewLink: eligUpload.webViewLink }
       : null;
 
+    logAudit({
+      actor: dispName, role: 'student', action: 'summary.generate',
+      target: auditTargetFor(studentName, studentIdentifier), details: null,
+    });
+
     res.json({
       success: true,
       fileId: summaryUploaded.id,
@@ -345,6 +367,10 @@ router.post('/student-meta', async (req, res) => {
     await writeStudentMeta(stuDir.id, metaObj);
 
     studentsCache.clear();
+    logAudit({
+      actor: sanitize(studentName.trim()), role: 'student', action: 'student.save',
+      target: auditTargetFor(studentName, studentIdentifier), details: null,
+    });
     res.json({ success: true });
   } catch (err) {
     console.error('student-meta error:', err.message);
