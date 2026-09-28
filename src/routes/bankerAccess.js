@@ -4,9 +4,14 @@ const {
   ROOT_FOLDER_ID, sanitize, buildFolderKey, findFolderByName, listAllFilesRecursive, readFileBuffer,
 } = require('../services/drive');
 const { readStudentMeta, writeStudentMeta } = require('../services/studentMeta');
-const { verifyJWT, verifyJWTFlexible, requireStaff } = require('../middleware/auth');
+const { verifyJWT, verifyJWTFlexible, requireStaff, requireSuperAdmin } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
+const {
+  createRequest: createBankerAccessRequest,
+  decideRequest: decideBankerAccessRequest,
+  listRequests: listBankerAccessRequests,
+} = require('../services/bankerAccessRequests');
 
 const router = express.Router();
 
@@ -38,6 +43,12 @@ const EXCLUDED_FILENAMES = new Set(['student_meta.json', 'eligibility_report.pdf
 
 // PUT /api/students/banker-access — staff only (superadmin/advisor)
 // Body: { studentName, studentIdentifier, bankerName, grant: boolean }
+//
+// Superadmins grant/revoke immediately, same as always. Advisors can still
+// revoke immediately (removing exposure needs no review) but a NEW grant from
+// an advisor is only a *request* — it lands in the pending queue for a
+// superadmin to approve, and student.sharedBankers is left untouched until
+// then. See services/bankerAccessRequests.js.
 router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
   try {
     const { studentName, studentIdentifier, bankerName, grant } = req.body;
@@ -52,6 +63,24 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
     }
 
     const { meta } = await readStudentMeta(stuDir.id);
+
+    if (grant && req.admin.role === 'advisor') {
+      if ((meta.sharedBankers || []).includes(bankerName)) {
+        return res.json({ success: true, alreadyShared: true, sharedBankers: meta.sharedBankers });
+      }
+      const { request, created } = await createBankerAccessRequest({
+        studentKey: folderKey, studentName, studentIdentifier: studentIdentifier || '', bankerName,
+        requestedBy: req.admin.name, requestedByRole: req.admin.role,
+      });
+      if (created) {
+        logAudit({
+          actor: req.admin.name, role: req.admin.role, action: 'banker_access.request',
+          target: folderKey, details: { banker: bankerName, requestId: request.id },
+        });
+      }
+      return res.json({ success: true, pending: true, request });
+    }
+
     const current = new Set(meta.sharedBankers || []);
     if (grant) current.add(bankerName);
     else current.delete(bankerName);
@@ -67,6 +96,87 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
     res.json({ success: true, sharedBankers: meta.sharedBankers });
   } catch (err) {
     console.error('bankerAccess error:', err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// GET /api/students/banker-access-requests — superadmin sees every request
+// (optionally filtered by ?status=pending|approved|rejected); an advisor
+// only ever sees their own, so they can tell what's still awaiting review.
+router.get('/banker-access-requests', verifyJWT, requireStaff, async (req, res) => {
+  try {
+    const { status } = req.query;
+    let requests = await listBankerAccessRequests();
+    if (req.admin.role === 'advisor') {
+      requests = requests.filter((r) => r.requestedBy === req.admin.name);
+    }
+    if (status) requests = requests.filter((r) => r.status === status);
+    requests = requests.slice().reverse(); // newest first
+    res.json({ success: true, requests });
+  } catch (err) {
+    console.error('bankerAccessRequests list error:', err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// POST /api/students/banker-access-requests/:id/approve — superadmin only.
+// Applies the grant the advisor asked for, exactly like the direct-grant
+// path above, then marks the request approved.
+router.post('/banker-access-requests/:id/approve', verifyJWT, requireSuperAdmin, async (req, res) => {
+  try {
+    const { request, error } = await decideBankerAccessRequest(req.params.id, {
+      approve: true, decidedBy: req.admin.name,
+    });
+    if (error === 'not_found') return res.status(404).json({ success: false, error: 'Request not found' });
+    if (error === 'already_decided') {
+      return res.status(409).json({ success: false, error: `Request has already been ${request.status}` });
+    }
+
+    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), request.studentKey);
+    if (!stuDir) {
+      return res.status(404).json({ success: false, error: 'Student folder not found — the request could not be applied' });
+    }
+
+    const { meta } = await readStudentMeta(stuDir.id);
+    const current = new Set(meta.sharedBankers || []);
+    current.add(request.bankerName);
+    meta.sharedBankers = Array.from(current);
+    await writeStudentMeta(stuDir.id, meta);
+    studentsCache.clear();
+
+    logAudit({
+      actor: req.admin.name, role: req.admin.role, action: 'banker_access.approve',
+      target: request.studentKey, details: { banker: request.bankerName, requestedBy: request.requestedBy, requestId: request.id },
+    });
+
+    res.json({ success: true, request, sharedBankers: meta.sharedBankers });
+  } catch (err) {
+    console.error('bankerAccessRequest approve error:', err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// POST /api/students/banker-access-requests/:id/reject — superadmin only.
+// Body (optional): { note } — shown to the advisor as the reason.
+router.post('/banker-access-requests/:id/reject', verifyJWT, requireSuperAdmin, async (req, res) => {
+  try {
+    const { note } = req.body || {};
+    const { request, error } = await decideBankerAccessRequest(req.params.id, {
+      approve: false, decidedBy: req.admin.name, note,
+    });
+    if (error === 'not_found') return res.status(404).json({ success: false, error: 'Request not found' });
+    if (error === 'already_decided') {
+      return res.status(409).json({ success: false, error: `Request has already been ${request.status}` });
+    }
+
+    logAudit({
+      actor: req.admin.name, role: req.admin.role, action: 'banker_access.reject',
+      target: request.studentKey, details: { banker: request.bankerName, requestedBy: request.requestedBy, requestId: request.id, note: note || null },
+    });
+
+    res.json({ success: true, request });
+  } catch (err) {
+    console.error('bankerAccessRequest reject error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
