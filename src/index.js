@@ -33,6 +33,7 @@ const bankerAccessRoutes = require('./routes/bankerAccess');
 const fileProxyRoutes   = require('./routes/fileProxy');
 const recoveryRoutes    = require('./routes/recovery');
 const auditRoutes       = require('./routes/audit');
+const documentReaderRoutes = require('./routes/documentReader');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -109,11 +110,23 @@ const findLimiter = rateLimit({
   message: { success: false, error: 'Too many lookup requests, please try again later.' },
 });
 
+// The document reader proxies to a third-party service that spends real
+// compute (3-15s) per call — a much lower ceiling than the general API
+// limit so one admin can't accidentally hammer that upstream service.
+const documentReaderLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,    // 5 minutes
+  max: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many document scans, please wait a few minutes and try again.' },
+});
+
 app.use('/api/auth',              authLimiter);
 app.use('/api/upload',            uploadLimiter);
 app.use('/api/student-upload',    uploadLimiter);
 app.use('/api/student-meta',      apiLimiter);
 app.use('/api/students/find',     findLimiter);
+app.use('/api/document-reader',   documentReaderLimiter);
 app.use('/api',                   apiLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -128,6 +141,7 @@ app.use('/api/students', bankerAccessRoutes);
 app.use('/api/students', recoveryRoutes);
 app.use('/api/files',    fileProxyRoutes);
 app.use('/api/audit',    auditRoutes);
+app.use('/api/document-reader', documentReaderRoutes);
 app.use('/api',          filesRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
