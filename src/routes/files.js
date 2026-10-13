@@ -31,6 +31,7 @@ function auditTargetFor(studentName, studentIdentifier) {
 router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (req, res) => {
   try {
     const { studentName, subFolder, fileName } = req.body;
+    const skipOcr = req.body.skipOcr === '1';
     const file = req.file;
     if (!studentName || !subFolder || !fileName || !file) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
@@ -44,7 +45,7 @@ router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (re
         const stuDir = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
         return getOrCreate(stuDir.id, sanitize(subFolder));
       })(),
-      convertToPdf(file.buffer, file.mimetype, cleanNameNoExt),
+      convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr }),
     ]);
 
     let finalBuffer   = pdfBuffer || file.buffer;
@@ -204,12 +205,13 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
 
     const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
     const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
+    const skipOcr = req.body.skipOcr === '1';
 
     // Folder lookup + PDF conversion run concurrently.
     // findFolderByName returns null if the folder doesn't exist (student not registered yet).
     const [stuDir, { pdfBuffer, extractedText }] = await Promise.all([
       findFolderByName(ROOT_FOLDER_ID(), folderKey),
-      convertToPdf(file.buffer, file.mimetype, cleanNameNoExt),
+      convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr }),
     ]);
 
     if (!stuDir) {

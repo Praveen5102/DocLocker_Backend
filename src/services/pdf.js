@@ -8,26 +8,28 @@ const DOC_TYPES = [
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
 ];
 
-async function convertToPdf(buffer, mimeType, baseName) {
+// skipOcr: the caller will read this file with our own document model, so
+// the Drive OCR round trip (and the regex parse that follows) is wasted work.
+async function convertToPdf(buffer, mimeType, baseName, { skipOcr = false } = {}) {
   if (IMAGE_TYPES.includes(mimeType)) {
-    return convertImageToPdf(buffer, mimeType, baseName);
+    return convertImageToPdf(buffer, mimeType, baseName, skipOcr);
   }
   if (DOC_TYPES.includes(mimeType)) {
     return convertDocToPdf(buffer, mimeType, baseName);
   }
   if (mimeType === 'application/pdf') {
     // Already a PDF — keep it as-is, just run OCR for text extraction
-    const extractedText = await extractTextViaOcr(buffer, mimeType, baseName);
+    const extractedText = skipOcr ? null : await extractTextViaOcr(buffer, mimeType, baseName);
     return { pdfBuffer: null, extractedText };
   }
   return { pdfBuffer: null, extractedText: null };
 }
 
 // Images: pdfkit for clean 1-page PDF + Google Drive OCR for text only
-async function convertImageToPdf(buffer, mimeType, baseName) {
+async function convertImageToPdf(buffer, mimeType, baseName, skipOcr) {
   const [pdfBuffer, extractedText] = await Promise.all([
     buildImagePdf(buffer, mimeType),
-    extractTextViaOcr(buffer, mimeType, baseName),
+    skipOcr ? Promise.resolve(null) : extractTextViaOcr(buffer, mimeType, baseName),
   ]);
   return { pdfBuffer, extractedText };
 }

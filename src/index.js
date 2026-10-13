@@ -34,6 +34,7 @@ const fileProxyRoutes   = require('./routes/fileProxy');
 const recoveryRoutes    = require('./routes/recovery');
 const auditRoutes       = require('./routes/audit');
 const documentReaderRoutes = require('./routes/documentReader');
+const studentExtractRoutes = require('./routes/studentExtract');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -121,12 +122,24 @@ const documentReaderLimiter = rateLimit({
   message: { success: false, error: 'Too many document scans, please wait a few minutes and try again.' },
 });
 
+// Student-side reads: a full application is passport + Aadhaar + PAN + 12th
+// for the student plus Aadhaar/PAN per co-applicant (up to 5), and a
+// two-page document is re-read when its second page arrives.
+const studentExtractLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,   // 15 minutes
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many documents read in a short time, please wait a few minutes and try again.' },
+});
+
 app.use('/api/auth',              authLimiter);
 app.use('/api/upload',            uploadLimiter);
 app.use('/api/student-upload',    uploadLimiter);
 app.use('/api/student-meta',      apiLimiter);
 app.use('/api/students/find',     findLimiter);
 app.use('/api/document-reader',   documentReaderLimiter);
+app.use('/api/student-extract',   studentExtractLimiter);
 app.use('/api',                   apiLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -142,6 +155,7 @@ app.use('/api/students', recoveryRoutes);
 app.use('/api/files',    fileProxyRoutes);
 app.use('/api/audit',    auditRoutes);
 app.use('/api/document-reader', documentReaderRoutes);
+app.use('/api/student-extract', studentExtractRoutes);
 app.use('/api',          filesRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
