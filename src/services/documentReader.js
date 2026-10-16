@@ -1,10 +1,10 @@
-// Client for our own document-reading model (certificate / passport /
-// Aadhaar / PAN). Shared by the admin verification tool and the student
+// Client for our own document-reading model (10th / SSC, 12th certificate,
+// passport, Aadhaar, PAN). Shared by the admin verification tool and the student
 // upload flow so both send identical requests and get identical errors.
 
 const READER_BASE_URL = process.env.DOCUMENT_READER_URL || 'https://certificate-reader-production.up.railway.app';
 
-const MAX_FILES = { certificate: 1, passport: 4, aadhaar: 4, pan: 4 };
+const MAX_FILES = { ssc: 1, certificate: 1, passport: 4, aadhaar: 4, pan: 4 };
 
 // What the model accepts — .doc/.docx uploads still go through the old OCR.
 const READER_MIME_TYPES = new Set([
@@ -77,13 +77,20 @@ function summarizeResult(docType, data) {
     },
     fields,
     checks: {
-      supported: full.supported ?? null,
+      // The SSC reader says what it recognised instead of a supported flag.
+      supported: full.supported ?? (docType === 'ssc' ? full.document_type === 'ssc' : null),
       mrzValid: full.mrz_valid ?? null,
       ...(full.checks || {}),
     },
     seconds: data?.seconds ?? null,
     readAt: new Date().toISOString(),
   };
+}
+
+// "SSC Public Examinations, March 2019" → "2019"
+function examYear(exam) {
+  const years = String(exam || '').match(/\b(19|20)\d{2}\b/g);
+  return years ? years[years.length - 1] : undefined;
 }
 
 function pick(...vals) {
@@ -145,6 +152,31 @@ function toLegacyParsed(docType, flat, { subFolder, sourceFile }) {
     set('Hall Ticket Number', flat.hall_ticket_number);
     set('Group', flat.group);
     set('Result', flat.result);
+  } else if (docType === 'ssc') {
+    type = '10th';
+    set('Name', flat.student_name);
+    set("Father's Name", flat.father_name);
+    set("Mother's Name", flat.mother_name);
+    set('Date of Birth', flat.date_of_birth);
+    set('Roll Number', flat.roll_number);
+    set('School', flat.school);
+    set('Board / University', flat.board);
+    set('Medium', flat.medium);
+    const cgpa = Number(flat.cgpa);
+    const pct = Number(flat.percentage);
+    if (flat.result_type === 'grades' && flat.cgpa != null && Number.isFinite(cgpa)) {
+      // Same CGPA → percentage convention the old parser uses (× 9.5).
+      set('Score Type', 'CGPA');
+      set('Display Score', `${cgpa.toFixed(1)} / 10`);
+      set('CGPA', `${cgpa.toFixed(1)} / 10`);
+      set('Percentage', `${(cgpa * 9.5).toFixed(2)}%`);
+    } else if (flat.percentage != null && Number.isFinite(pct)) {
+      set('Score Type', 'Percentage');
+      set('Display Score', `${pct}%`);
+      set('Percentage', `${pct.toFixed(2)}%`);
+    }
+    if (flat.total_marks != null && flat.maximum_marks != null) set('Marks', `${flat.total_marks} / ${flat.maximum_marks}`);
+    set('Year of Passing', examYear(flat.exam));
   } else {
     return null;
   }
