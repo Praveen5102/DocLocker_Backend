@@ -6,7 +6,8 @@ const {
 const {
   resolveStudent, readMeta, updateMeta, listDocuments, readDocumentBytes,
 } = require('../services/studentStore');
-const { verifyJWT, verifyJWTFlexible, requireStaff, requireSuperAdmin } = require('../middleware/auth');
+const { verifyJWT, verifyJWTOrTicket, requireStaff, requireSuperAdmin } = require('../middleware/auth');
+const { issueTicket } = require('../services/fileTickets');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
 const {
@@ -287,9 +288,21 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
   }
 });
 
+// POST /api/students/:studentKey/files/zip-link — a one-time link (valid 2
+// minutes, this student's zip only) for the browser to download from.
+// Access is checked when the link is used.
+router.post('/:studentKey/files/zip-link', verifyJWT, (req, res) => {
+  const ticket = issueTicket({ kind: 'zip', target: req.params.studentKey, admin: req.admin });
+  res.json({
+    success: true,
+    url: `/api/students/${encodeURIComponent(req.params.studentKey)}/files/zip?ticket=${encodeURIComponent(ticket)}`,
+  });
+});
+
 // GET /api/students/:studentKey/files/zip — download all visible docs as a zip
-// Same access rules as the files listing endpoint.
-router.get('/:studentKey/files/zip', verifyJWTFlexible, async (req, res) => {
+// Same access rules as the files listing endpoint. Opened with a one-time
+// link from zip-link above (or the Authorization header).
+router.get('/:studentKey/files/zip', verifyJWTOrTicket('zip', (req) => req.params.studentKey), async (req, res) => {
   try {
     const folderKey = sanitize(req.params.studentKey);
     const ref = await resolveStudent(folderKey);
@@ -306,6 +319,11 @@ router.get('/:studentKey/files/zip', verifyJWTFlexible, async (req, res) => {
     if (visible.length === 0) {
       return res.status(404).json({ success: false, error: 'No documents found' });
     }
+
+    logAudit({
+      actor: req.admin.name, role: req.admin.role, action: 'document.download_all',
+      target: ref.key, details: { files: visible.length },
+    });
 
     const safeFolderKey = folderKey.replace(/[^a-zA-Z0-9_\-.]/g, '_');
     res.setHeader('Content-Type', 'application/zip');

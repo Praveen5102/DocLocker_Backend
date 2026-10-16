@@ -336,6 +336,7 @@ async function deleteRailwayStudent(ref) {
 
 module.exports = {
   GENERATED_FILES,
+  ownerOrgId,
   studentKeyOf,
   isRailwayFileId,
   resolveStudent,

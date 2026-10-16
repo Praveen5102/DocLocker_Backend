@@ -174,8 +174,8 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
 
     await step('banker without access is refused everywhere', async () => {
       const files = await call('GET', `/api/students/${encodeURIComponent(KEY)}/files`, { token: BANKER });
-      const content = await call('GET', `/api/files/${fileId}/content?token=${BANKER}`);
-      const zip = await call('GET', `/api/students/${encodeURIComponent(KEY)}/files/zip?token=${BANKER}`);
+      const content = await call('GET', `/api/files/${fileId}/content`, { token: BANKER });
+      const zip = await call('GET', `/api/students/${encodeURIComponent(KEY)}/files/zip`, { token: BANKER });
       const loan = await call('PUT', `/api/students/${encodeURIComponent(KEY)}/loan-status`, { token: BANKER, json: { loanStatus: 'inprocess' } });
       assert.deepStrictEqual([files.status, content.status, zip.status, loan.status], [403, 403, 403, 403]);
       assert.strictEqual((await call('GET', '/api/students', { token: BANKER })).data.students.some((s) => s.studentKey === KEY), false);
@@ -188,16 +188,43 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
       assert.deepStrictEqual(r.data.sharedBankers, ['Smoke Bank']);
     });
 
-    await step('banker with access gets the exact document back', async () => {
-      const r = await call('GET', `/api/files/${fileId}/content?token=${BANKER}&mode=download`);
+    await step('banker with access views the exact document in the app', async () => {
+      const r = await call('GET', `/api/files/${fileId}/content?mode=view`, { token: BANKER });
       assert.strictEqual(r.status, 200);
       assert.ok(r.data.equals(PDF_B), 'bytes must match the latest upload');
-      assert.match(r.headers.get('content-disposition'), /^attachment; filename="Passport.pdf"/);
+      assert.match(r.headers.get('content-disposition'), /^inline; filename="Passport.pdf"/);
       assert.strictEqual(r.headers.get('cache-control'), 'private, no-store');
     });
 
-    await step('banker downloads all documents as a zip', async () => {
-      const r = await call('GET', `/api/students/${encodeURIComponent(KEY)}/files/zip?token=${BANKER}`);
+    await step('a login token in the URL is refused', async () => {
+      const r = await call('GET', `/api/files/${fileId}/content?token=${BANKER}`);
+      assert.strictEqual(r.status, 401);
+      const z = await call('GET', `/api/students/${encodeURIComponent(KEY)}/files/zip?token=${BANKER}`);
+      assert.strictEqual(z.status, 401);
+    });
+
+    await step('one-time download link works once, for that file only', async () => {
+      const link = await call('POST', `/api/files/${fileId}/download-link`, { token: BANKER });
+      assert.strictEqual(link.data.success, true);
+      assert.ok(!link.data.url.includes(BANKER), 'link must not contain the login token');
+      const first = await call('GET', link.data.url);
+      assert.strictEqual(first.status, 200);
+      assert.ok(first.data.equals(PDF_B));
+      assert.match(first.headers.get('content-disposition'), /^attachment;/);
+      const again = await call('GET', link.data.url);
+      assert.strictEqual(again.status, 401, 'second use must be refused');
+
+      const other = await call('POST', `/api/files/${fileId}/download-link`, { token: BANKER });
+      const ticket = new URL(base + other.data.url).searchParams.get('ticket');
+      const swapped = await call('GET', `/api/files/rw_00000000-0000-0000-0000-000000000000/content?ticket=${encodeURIComponent(ticket)}`);
+      assert.strictEqual(swapped.status, 401, 'ticket for one file must not open another');
+      const asLogin = await call('GET', '/api/students', { token: ticket });
+      assert.strictEqual(asLogin.status, 401, 'ticket must not work as a login token');
+    });
+
+    await step('banker downloads all documents as a zip via a one-time link', async () => {
+      const link = await call('POST', `/api/students/${encodeURIComponent(KEY)}/files/zip-link`, { token: BANKER });
+      const r = await call('GET', link.data.url);
       assert.strictEqual(r.status, 200);
       assert.strictEqual(r.data.slice(0, 2).toString(), 'PK');
       assert.ok(r.data.includes(Buffer.from('GOVT ID/Passport.pdf')), 'zip keeps sections as folders');
@@ -224,7 +251,10 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
 
     await step('audit trail recorded for registration, uploads and access', async () => {
       const actions = new Set(audit.map((a) => a.action));
-      for (const a of ['student.save', 'document.upload', 'summary.generate', 'banker_access.grant', 'loan_status.update']) {
+      const views = audit.filter((a) => a.action === 'document.view');
+      assert.ok(views.every((v) => v.actor === 'Smoke Bank' && v.target === KEY && v.details.file === 'Passport.pdf'), 'view entries name who, which student, which file');
+      for (const a of ['student.save', 'document.upload', 'summary.generate', 'banker_access.grant', 'loan_status.update',
+        'document.view', 'document.download', 'document.download_all']) {
         assert.ok(actions.has(a), `missing audit action ${a}`);
       }
     });

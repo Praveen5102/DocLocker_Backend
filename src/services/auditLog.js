@@ -1,12 +1,26 @@
 const crypto = require('crypto');
 const { ROOT_FOLDER_ID, findFilesByName, readJsonFile, trashFilesByNameExcept, createJsonFile } = require('./drive');
+const { query } = require('../db');
+const { isRailwayStorageReady } = require('../db/startup');
+const { ownerOrgId } = require('./studentStore');
+
+// Where entries go:
+//   - Railway storage ready → Postgres (audit_log table). No size cap, so
+//     high-volume entries like document views never push out important
+//     ones like approvals or deletions.
+//   - otherwise → the audit_log.json file in Drive, as before.
+// Reads merge both, so the history from before the switch stays visible.
+
+// How many Postgres entries a read pulls in (newest first). The API caps
+// what it returns per request well below this.
+const DB_READ_LIMIT = 5000;
 
 // Keeps the file from growing forever — old entries roll off once the log
 // passes this size. Generous enough that nothing an admin would actually
 // want to look back on gets lost in normal use.
 const MAX_ENTRIES = 2000;
 
-async function readAuditLog() {
+async function readDriveAuditLog() {
   const files = await findFilesByName(ROOT_FOLDER_ID(), 'audit_log.json');
   if (files.length === 0) return [];
   try {
@@ -16,6 +30,25 @@ async function readAuditLog() {
     console.warn('Failed to parse audit_log.json:', err.message);
     return [];
   }
+}
+
+async function readDbAuditLog() {
+  if (!isRailwayStorageReady()) return [];
+  const { rows } = await query(
+    `SELECT id, ts, actor, role, action, target, details FROM audit_log
+      WHERE org_id = $1 ORDER BY ts DESC, id DESC LIMIT $2`,
+    [await ownerOrgId(), DB_READ_LIMIT],
+  );
+  return rows.reverse().map((r) => ({
+    id: `db-${r.id}`, ts: r.ts.toISOString(), actor: r.actor, role: r.role || '',
+    action: r.action, target: r.target || '', details: r.details,
+  }));
+}
+
+// Oldest first, Drive history followed by everything since the switch.
+async function readAuditLog() {
+  const [driveEntries, dbEntries] = await Promise.all([readDriveAuditLog(), readDbAuditLog()]);
+  return [...driveEntries, ...dbEntries].sort((a, b) => (a.ts < b.ts ? -1 : a.ts > b.ts ? 1 : 0));
 }
 
 async function writeAuditLog(entries) {
@@ -33,7 +66,14 @@ async function writeAuditLog(entries) {
 let _writeChain = Promise.resolve();
 
 async function appendEntry({ actor, role, action, target, details }) {
-  const entries = await readAuditLog();
+  if (isRailwayStorageReady()) {
+    await query(
+      'INSERT INTO audit_log (org_id, actor, role, action, target, details) VALUES ($1, $2, $3, $4, $5, $6)',
+      [await ownerOrgId(), actor || 'unknown', role || '', action, target || '', details || null],
+    );
+    return;
+  }
+  const entries = await readDriveAuditLog();
   entries.push({
     id: crypto.randomUUID(),
     ts: new Date().toISOString(),

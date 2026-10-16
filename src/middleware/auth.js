@@ -1,4 +1,5 @@
 const jwt = require('jsonwebtoken');
+const { redeemTicket } = require('../services/fileTickets');
 
 function verifyJWT(req, res, next) {
   const header = req.headers.authorization;
@@ -29,22 +30,27 @@ function requireStaff(req, res, next) {
   next();
 }
 
-// Same as verifyJWT, but also accepts the token via ?token= query param.
-// Needed for endpoints loaded directly by the browser as a resource URL
-// (<img src>, <iframe src>, download links) where we can't attach a custom
-// Authorization header.
-function verifyJWTFlexible(req, res, next) {
-  const header = req.headers.authorization;
-  const token = (header && header.startsWith('Bearer ')) ? header.split(' ')[1] : req.query.token;
-  if (!token) {
-    return res.status(401).json({ success: false, error: 'No token provided' });
-  }
-  try {
-    req.admin = jwt.verify(token, process.env.JWT_SECRET);
+// For endpoints a browser may load as a plain link (file downloads, zip).
+// Accepts either the normal Authorization header (in-app fetches) or a
+// one-time ticket for exactly this resource (?ticket=…, see
+// services/fileTickets.js). A full login token in the URL is NOT accepted —
+// a forwarded link must never hand over the account.
+// targetOf(req) names the resource the ticket must have been issued for.
+function verifyJWTOrTicket(kind, targetOf) {
+  return (req, res, next) => {
+    const header = req.headers.authorization;
+    if (header && header.startsWith('Bearer ')) return verifyJWT(req, res, next);
+    if (!req.query.ticket) {
+      return res.status(401).json({ success: false, error: 'No token provided' });
+    }
+    const holder = redeemTicket(req.query.ticket, { kind, target: targetOf(req) });
+    if (!holder) {
+      return res.status(401).json({ success: false, error: 'This download link has expired or was already used. Start the download again from DocLocker.' });
+    }
+    req.admin = holder;
+    req.viaTicket = true;
     next();
-  } catch {
-    res.status(401).json({ success: false, error: 'Invalid or expired token' });
-  }
+  };
 }
 
-module.exports = { verifyJWT, verifyJWTFlexible, requireSuperAdmin, requireStaff };
+module.exports = { verifyJWT, verifyJWTOrTicket, requireSuperAdmin, requireStaff };
