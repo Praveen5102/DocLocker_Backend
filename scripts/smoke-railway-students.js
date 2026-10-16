@@ -29,7 +29,10 @@ const stub = (rel, exports) => {
 };
 stub('auditLog', { logAudit: (entry) => audit.push(entry) });
 const TINY_PDF = Buffer.from('%PDF-1.4\n% generated eligibility report stand-in\n%%EOF\n');
-stub('pdf', { convertHtmlToPdf: async () => TINY_PDF });
+// convertToPdf normally runs Google's OCR through Drive; the test supplies
+// the "OCR text" itself (fakeOcr) so the other-board fallback can be tested.
+let fakeOcr = '';
+stub('pdf', { convertHtmlToPdf: async () => TINY_PDF, convertToPdf: async () => ({ pdfBuffer: null, extractedText: fakeOcr }) });
 
 const app = require('../src/index');
 const { initRailwayStorage } = require('../src/db/startup');
@@ -67,11 +70,22 @@ async function call(method, url, { token, json, form } = {}) {
   return { status: res.status, data, headers: res.headers };
 }
 
-function uploadForm(buffer, fileName = 'Passport.pdf') {
+// Test documents for the upload gate, built as real PDFs our model can read.
+async function textPdf(lines) {
+  const { PDFDocument, StandardFonts } = require('pdf-lib');
+  const doc = await PDFDocument.create();
+  const page = doc.addPage([700, 450]);
+  const font = await doc.embedFont(StandardFonts.HelveticaBold);
+  lines.forEach((l, i) => page.drawText(l, { x: 40, y: 400 - i * 38, size: 22, font }));
+  return Buffer.from(await doc.save());
+}
+
+// Default slot (Resume) isn't checked by the upload gate.
+function uploadForm(buffer, fileName = 'Resume.pdf', subFolder = 'GOVT ID') {
   const fd = new FormData();
   fd.append('studentName', NAME);
   fd.append('studentIdentifier', ID);
-  fd.append('subFolder', 'GOVT ID');
+  fd.append('subFolder', subFolder);
   fd.append('fileName', fileName);
   fd.append('skipOcr', '1');
   fd.append('file', new Blob([buffer], { type: 'application/pdf' }), fileName);
@@ -124,9 +138,58 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
       const { rows } = await query(
         `SELECT count(*) FILTER (WHERE deleted_at IS NULL)::int AS live, count(*)::int AS total
            FROM documents d JOIN students s ON s.id = d.student_id
-          WHERE s.folder_key = $1 AND d.file_name = 'Passport.pdf'`, [KEY]);
+          WHERE s.folder_key = $1 AND d.file_name = 'Resume.pdf'`, [KEY]);
       assert.deepStrictEqual(rows[0], { live: 1, total: 2 });
       fileId = r.data.fileId;
+    });
+
+    const PAN_PDF = await textPdf(['INCOME TAX DEPARTMENT', 'GOVT. OF INDIA', 'Permanent Account Number Card', 'ABCPK1234F',
+      'Name', 'RAILWAY SMOKE', 'Date of Birth', '12/06/2004']);
+    const HOLIDAY_PDF = await textPdf(['Holiday photos', 'Goa beach 2023']);
+    const slotFiles = async (name) => (await query(
+      `SELECT count(*)::int AS n FROM documents d JOIN students s ON s.id = d.student_id
+        WHERE s.folder_key = $1 AND d.file_name = $2 AND d.deleted_at IS NULL`, [KEY, name])).rows[0].n;
+
+    await step('gate: a wrong document in the PAN slot is rejected and never saved', async () => {
+      const r = await call('POST', '/api/student-upload', { form: uploadForm(HOLIDAY_PDF, 'PAN_Card.pdf') });
+      assert.strictEqual(r.status, 422, JSON.stringify(r.data));
+      assert.strictEqual(r.data.rejected, true);
+      assert.match(r.data.error, /doesn’t look like a PAN card/);
+      assert.strictEqual(await slotFiles('PAN_Card.pdf'), 0);
+    });
+
+    await step('gate: a PAN card in the passport slot is rejected', async () => {
+      const r = await call('POST', '/api/student-upload', { form: uploadForm(PAN_PDF, 'Passport.pdf') });
+      assert.strictEqual(r.status, 422, JSON.stringify(r.data));
+      assert.strictEqual(await slotFiles('Passport.pdf'), 0);
+    });
+
+    await step('gate: the right document is accepted, saved and read in one step', async () => {
+      const r = await call('POST', '/api/student-upload', { form: uploadForm(PAN_PDF, 'PAN_Card.pdf') });
+      assert.strictEqual(r.data.success, true, JSON.stringify(r.data));
+      assert.strictEqual(r.data.reader.gate.status, 'accepted');
+      assert.strictEqual(r.data.reader.extraction.flat.pan_number, 'ABCPK1234F');
+      assert.strictEqual(r.data.reader.extraction.gate.status, 'accepted');
+      assert.strictEqual(r.data.reader.parsedData.type, 'pan');
+      assert.strictEqual(await slotFiles('PAN_Card.pdf'), 1);
+    });
+
+    await step('gate: 10th slot rejects a random file, accepts another board’s memo from its text', async () => {
+      fakeOcr = 'Holiday photos Goa beach 2023';
+      const bad = await call('POST', '/api/student-upload', { form: uploadForm(HOLIDAY_PDF, '10th_Marksheet.pdf', 'Academics') });
+      assert.strictEqual(bad.status, 422, JSON.stringify(bad.data));
+      fakeOcr = 'CENTRAL BOARD OF SECONDARY EDUCATION Secondary School Examination 2019 Marks Statement Roll No Subject Total Result PASS';
+      const ok = await call('POST', '/api/student-upload', { form: uploadForm(HOLIDAY_PDF, '10th_Marksheet.pdf', 'Academics') });
+      fakeOcr = '';
+      assert.strictEqual(ok.data.success, true, JSON.stringify(ok.data));
+      assert.strictEqual(ok.data.reader.gate.status, 'accepted');
+      assert.match(ok.data.reader.gate.reason, /Board not read by our model/);
+    });
+
+    await step('gate: other slots are not checked', async () => {
+      const r = await call('POST', '/api/student-upload', { form: uploadForm(HOLIDAY_PDF, 'Visa_History.pdf') });
+      assert.strictEqual(r.data.success, true, JSON.stringify(r.data));
+      assert.strictEqual(r.data.reader, undefined);
     });
 
     await step('summary + eligibility report saved to the bucket', async () => {
@@ -166,7 +229,7 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
     await step('staff file listing groups by section and hides internal files', async () => {
       const r = await call('GET', `/api/students/${encodeURIComponent(KEY)}/files`, { token: SUPER });
       assert.strictEqual(r.data.success, true, JSON.stringify(r.data));
-      assert.deepStrictEqual(r.data.groups['GOVT ID'].map((f) => f.name), ['Passport.pdf']);
+      assert.ok(r.data.groups['GOVT ID'].map((f) => f.name).includes('Resume.pdf'));
       const others = (r.data.groups.Others || []).map((f) => f.name);
       assert.ok(others.includes('Student_Summary.pdf'));
       assert.ok(!others.includes('Eligibility_Report.pdf'), 'eligibility report hidden');
@@ -192,7 +255,7 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
       const r = await call('GET', `/api/files/${fileId}/content?mode=view`, { token: BANKER });
       assert.strictEqual(r.status, 200);
       assert.ok(r.data.equals(PDF_B), 'bytes must match the latest upload');
-      assert.match(r.headers.get('content-disposition'), /^inline; filename="Passport.pdf"/);
+      assert.match(r.headers.get('content-disposition'), /^inline; filename="Resume.pdf"/);
       assert.strictEqual(r.headers.get('cache-control'), 'private, no-store');
     });
 
@@ -227,7 +290,7 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
       const r = await call('GET', link.data.url);
       assert.strictEqual(r.status, 200);
       assert.strictEqual(r.data.slice(0, 2).toString(), 'PK');
-      assert.ok(r.data.includes(Buffer.from('GOVT ID/Passport.pdf')), 'zip keeps sections as folders');
+      assert.ok(r.data.includes(Buffer.from('GOVT ID/Resume.pdf')), 'zip keeps sections as folders');
     });
 
     await step('banker updates loan status; searchable column follows', async () => {
@@ -252,8 +315,8 @@ function uploadForm(buffer, fileName = 'Passport.pdf') {
     await step('audit trail recorded for registration, uploads and access', async () => {
       const actions = new Set(audit.map((a) => a.action));
       const views = audit.filter((a) => a.action === 'document.view');
-      assert.ok(views.every((v) => v.actor === 'Smoke Bank' && v.target === KEY && v.details.file === 'Passport.pdf'), 'view entries name who, which student, which file');
-      for (const a of ['student.save', 'document.upload', 'summary.generate', 'banker_access.grant', 'loan_status.update',
+      assert.ok(views.every((v) => v.actor === 'Smoke Bank' && v.target === KEY && v.details.file === 'Resume.pdf'), 'view entries name who, which student, which file');
+      for (const a of ['student.save', 'document.upload', 'document.rejected', 'summary.generate', 'banker_access.grant', 'loan_status.update',
         'document.view', 'document.download', 'document.download_all']) {
         assert.ok(actions.has(a), `missing audit action ${a}`);
       }

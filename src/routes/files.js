@@ -3,13 +3,16 @@ const multer  = require('multer');
 const {
   sanitize, buildFolderKey, cleanFolderKey, folderKeyDisplayName,
   getOrCreate, trashFilesByNameExcept, uploadBuffer,
+  findFolderByName, listFilesInFolder, readFileBuffer,
 } = require('../services/drive');
 const { convertToPdf, convertHtmlToPdf } = require('../services/pdf');
 const { parseDocument }                  = require('../services/documentParser');
 const { buildEligibilityHtml }           = require('../services/eligibilityReport');
 const {
-  resolveStudent, resolveOrCreateStudent, writeMeta, storeDocument,
+  resolveStudent, resolveOrCreateStudent, writeMeta, storeDocument, listDocuments, readDocumentBytes,
 } = require('../services/studentStore');
+const { readerForSlot, slotBase, checkUpload } = require('../services/uploadGate');
+const { summarizeResult, toLegacyParsed } = require('../services/documentReader');
 const { studentsCache }                  = require('../services/cache');
 const { verifyJWT, requireStaff }        = require('../middleware/auth');
 const { logAudit }                       = require('../services/auditLog');
@@ -67,6 +70,68 @@ async function saveUpload(ref, { subFolder, fileName, file, converted, uploadedB
   return { fileId: uploaded.id, webViewLink: uploaded.webViewLink || null, fileName: uploaded.name, parsedData };
 }
 
+// Pages already saved for a two-page slot (e.g. the passport photo page when
+// the last page arrives), so the new page is checked together with them.
+// `replacing` = names this upload overwrites, which aren't context.
+const MAX_CONTEXT_BYTES = 20 * 1024 * 1024;
+async function slotContextPages(ref, section, fileName, replacing) {
+  const base = slotBase(fileName);
+  const isSlotPage = (name) => slotBase(name) === base && !replacing.includes(name);
+  if (ref.kind === 'railway') {
+    const docs = (await listDocuments(ref)).filter((d) => d.section === section && isSlotPage(d.name)).slice(-3);
+    const pages = await Promise.all(docs.map(async (d) => {
+      const f = await readDocumentBytes(d.id);
+      return f && { buffer: f.buffer, mimetype: f.mimeType, originalname: f.name };
+    }));
+    return pages.filter((pg) => pg && pg.buffer.length <= MAX_CONTEXT_BYTES);
+  }
+  const subDir = await findFolderByName(ref.dir.id, section);
+  if (!subDir) return [];
+  const files = (await listFilesInFolder(subDir.id))
+    .filter((f) => isSlotPage(f.name) && Number(f.size || 0) <= MAX_CONTEXT_BYTES)
+    .slice(0, 3);
+  return Promise.all(files.map(async (f) => ({ buffer: await readFileBuffer(f.id), mimetype: f.mimeType, originalname: f.name })));
+}
+
+// Reads ID / certificate slots BEFORE saving (services/uploadGate.js): a
+// wrong document is rejected and never stored. Every other slot is saved
+// as before. Returns { rejected, reason } or { result } (the API fields).
+async function processUpload(ref, { subFolder, fileName, file, skipOcr, uploadedBy }) {
+  const section = sanitize(subFolder);
+  const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
+  const docType = readerForSlot(fileName);
+  // Certificates always get the old text reading: it's how memos from
+  // boards our model doesn't read are recognised.
+  const needsText = docType === 'ssc' || docType === 'certificate';
+  const convertedP = convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr: skipOcr && !needsText });
+  convertedP.catch(() => {}); // awaited below; never an unhandled rejection meanwhile
+
+  let check = null;
+  if (docType) {
+    const multiPage = docType === 'passport' || docType === 'aadhaar';
+    const context = multiPage
+      ? await slotContextPages(ref, section, fileName, [fileName, `${cleanNameNoExt}.pdf`]).catch(() => [])
+      : [];
+    check = await checkUpload({
+      docType,
+      files: [...context, { buffer: file.buffer, mimetype: file.mimetype, originalname: file.originalname || fileName }],
+      ocrText: convertedP.then((c) => c.extractedText),
+    });
+    if (check.gate.status === 'rejected') return { rejected: true, reason: check.gate.reason, docType };
+  }
+
+  const converted = await convertedP;
+  const result = await saveUpload(ref, { subFolder, fileName, file, converted, uploadedBy });
+  if (check) {
+    result.reader = { gate: check.gate };
+    if (check.data) {
+      result.reader.extraction = { ...summarizeResult(docType, check.data), gate: check.gate };
+      result.reader.parsedData = toLegacyParsed(docType, check.data.flat || {}, { subFolder: section, sourceFile: result.fileName });
+    }
+  }
+  return { result };
+}
+
 // Saves one auto-generated report (Student_Summary.pdf / Eligibility_Report.pdf)
 // into the student's "Others" section, replacing the previous copy.
 async function saveGeneratedPdf(ref, fileName, buffer, uploadedBy) {
@@ -114,16 +179,16 @@ router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (re
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
 
-    const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
-
-    // Student lookup and PDF conversion are independent — run them together.
-    const [ref, converted] = await Promise.all([
-      resolveOrCreateStudent(cleanFolderKey(studentName)),
-      convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr }),
-    ]);
-
-    const result = await saveUpload(ref, { subFolder, fileName, file, converted, uploadedBy: req.admin.name });
-    res.json({ success: true, ...result });
+    const ref = await resolveOrCreateStudent(cleanFolderKey(studentName));
+    const out = await processUpload(ref, { subFolder, fileName, file, skipOcr, uploadedBy: req.admin.name });
+    if (out.rejected) {
+      logAudit({
+        actor: req.admin.name, role: req.admin.role, action: 'document.rejected',
+        target: ref.key, details: { subFolder: sanitize(subFolder), fileName, docType: out.docType },
+      });
+      return res.status(422).json({ success: false, rejected: true, error: out.reason });
+    }
+    res.json({ success: true, ...out.result });
   } catch (err) {
     console.error('Upload error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -222,25 +287,29 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
     }
 
     const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
-    const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
     const skipOcr = req.body.skipOcr === '1';
 
-    const [ref, converted] = await Promise.all([
-      resolveStudent(folderKey),
-      convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr }),
-    ]);
-
+    const ref = await resolveStudent(folderKey);
     if (!ref) {
       return res.status(404).json({ success: false, error: 'Student not found. Please complete registration first.' });
     }
 
-    const result = await saveUpload(ref, {
-      subFolder: subFolder.trim(), fileName, file, converted, uploadedBy: sanitize(studentName.trim()),
+    const out = await processUpload(ref, {
+      subFolder: subFolder.trim(), fileName, file, skipOcr, uploadedBy: sanitize(studentName.trim()),
     });
+    if (out.rejected) {
+      logAudit({
+        actor: sanitize(studentName.trim()), role: 'student', action: 'document.rejected',
+        target: auditTargetFor(studentName, studentIdentifier), details: { subFolder: sanitize(subFolder), fileName, docType: out.docType },
+      });
+      return res.status(422).json({ success: false, rejected: true, error: out.reason });
+    }
+    const result = out.result;
 
     logAudit({
       actor: sanitize(studentName.trim()), role: 'student', action: 'document.upload',
-      target: auditTargetFor(studentName, studentIdentifier), details: { subFolder: sanitize(subFolder), fileName: result.fileName },
+      target: auditTargetFor(studentName, studentIdentifier),
+      details: { subFolder: sanitize(subFolder), fileName: result.fileName, ...(result.reader && { check: result.reader.gate.status }) },
     });
 
     res.json({ success: true, ...result });
