@@ -3,6 +3,9 @@ const { ROOT_FOLDER_ID, cleanFolderKey, listFolders, findFilesByName, findFolder
 const { verifyJWT, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
+const {
+  listRailwayStudents, findRailwayStudentByIdentifier, resolveStudent, deleteRailwayStudent,
+} = require('../services/studentStore');
 
 const router = express.Router();
 
@@ -41,8 +44,12 @@ router.get('/', verifyJWT, async (req, res) => {
     if (studentsCache.isValid()) {
       students = studentsCache.data;
     } else {
-      const folders = await listFolders(ROOT_FOLDER_ID());
-      students = await Promise.all(
+      // New students live on Railway, everyone else in Drive — one list.
+      const [folders, railwayStudents] = await Promise.all([
+        listFolders(ROOT_FOLDER_ID()),
+        listRailwayStudents(),
+      ]);
+      const driveStudents = await Promise.all(
         folders.map(async (folder) => {
           const obj = { name: folder.name, driveUrl: folder.webViewLink };
           const { metaFiles, summaryFile, eligibilityFile } = await findMetaFile(folder.id);
@@ -67,6 +74,7 @@ router.get('/', verifyJWT, async (req, res) => {
           return { ...obj, summaryPdf, eligibilityPdf };
         })
       );
+      students = [...railwayStudents, ...driveStudents];
       studentsCache.set(students);
     }
 
@@ -103,7 +111,11 @@ router.get('/find', async (req, res) => {
       // Not in warm cache (new student) — fall through to Drive scan
     }
 
-    // 2. Cold / new student — match by folder name suffix (no meta reads for lookup)
+    // 2. New students on Railway — one indexed query.
+    const railwayHit = await findRailwayStudentByIdentifier(safeId);
+    if (railwayHit) return res.json({ success: true, student: railwayHit });
+
+    // 3. Cold / older student — match Drive folder name suffix (no meta reads for lookup)
     // Try both @-preserved and sanitized suffix to handle folders created by different code paths
     const suffix = `__${safeId}`;
     const suffixSanitized = `__${safeId.replace(/[^a-zA-Z0-9 _\-.]/g, '_')}`;
@@ -132,7 +144,7 @@ router.get('/find', async (req, res) => {
   }
 });
 
-// DELETE /api/students — permanently delete a student folder (staff only —
+// DELETE /api/students — permanently delete a student (staff only —
 // both superadmin and advisor pass requireStaff; only banker accounts are blocked).
 // Uses deletePermanently (hard delete), NOT trash — trashFile() only moves the
 // folder into Drive's Trash: recoverable for 30 days and still counted against
@@ -153,7 +165,20 @@ router.get('/find', async (req, res) => {
 // happen and must not remove the row from its own list.
 router.delete('/', verifyJWT, requireStaff, async (req, res) => {
   try {
-    const { studentName, folderId } = req.body;
+    const { studentName, folderId, studentKey } = req.body;
+
+    // Railway students are addressed by their student key (no Drive folder).
+    if (studentKey) {
+      const ref = await resolveStudent(studentKey);
+      if (!ref || ref.kind !== 'railway') {
+        studentsCache.clear();
+        return res.status(404).json({ success: false, error: 'Student not found — nothing was deleted. Refresh the list and try again.' });
+      }
+      const { documents } = await deleteRailwayStudent(ref);
+      studentsCache.clear();
+      logAudit({ actor: req.admin.name, role: req.admin.role, action: 'student.delete', target: ref.key, details: { storage: 'railway', documents } });
+      return res.json({ success: true, deleted: 1 });
+    }
 
     if (folderId) {
       try {

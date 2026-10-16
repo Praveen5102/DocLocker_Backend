@@ -34,6 +34,7 @@ const fileProxyRoutes   = require('./routes/fileProxy');
 const recoveryRoutes    = require('./routes/recovery');
 const auditRoutes       = require('./routes/audit');
 const documentReaderRoutes = require('./routes/documentReader');
+const { initRailwayStorage } = require('./db/startup');
 const studentExtractRoutes = require('./routes/studentExtract');
 
 const app  = express();
@@ -167,6 +168,13 @@ app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err.message);
   const message = isProd ? 'Internal server error' : err.message;
   res.status(err.status || 500).json({ success: false, error: message });
+});
+
+// ── Railway storage (Postgres + encrypted bucket) ─────────────────────────────
+// Dormant until DATABASE_URL is set. A failure here must never take the API
+// down — Drive-backed features keep working and the error is logged loudly.
+initRailwayStorage({ schedule: require.main === module }).catch((err) => {
+  console.error('[storage] Railway storage failed to initialise — using Google Drive:', err.message);
 });
 
 // ── Start (skipped when imported by Vercel serverless) ────────────────────────

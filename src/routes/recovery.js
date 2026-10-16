@@ -1,9 +1,11 @@
 const express = require('express');
 const Anthropic = require('@anthropic-ai/sdk');
 const {
-  ROOT_FOLDER_ID, sanitize, buildFolderKey, cleanFolderKey, findFolderByName, findFilesByName, readFileBuffer,
+  cleanFolderKey, findFolderByName, findFilesByName, readFileBuffer,
 } = require('../services/drive');
-const { readStudentMeta, writeStudentMeta } = require('../services/studentMeta');
+const {
+  resolveStudent, readMeta, writeMeta, findLatestDocument, readDocumentBytes,
+} = require('../services/studentStore');
 const { extractTextViaOcr } = require('../services/pdf');
 const { verifyJWT, requireStaff } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
@@ -88,31 +90,34 @@ Return JSON with this exact structure (include only non-null fields, but keep al
   }
 }`;
 
+// Latest Student_Summary.pdf bytes, or null. Drive students: prefer
+// Others/, fall back to the folder root (older layout).
+async function readSummaryPdf(ref) {
+  if (ref.kind === 'railway') {
+    const id = await findLatestDocument(ref, 'Others', 'Student_Summary.pdf');
+    return id ? (await readDocumentBytes(id)).buffer : null;
+  }
+  const othersDir = await findFolderByName(ref.dir.id, 'Others');
+  const candidates = othersDir ? await findFilesByName(othersDir.id, 'Student_Summary.pdf') : [];
+  const summaryFiles = candidates.length > 0 ? candidates : await findFilesByName(ref.dir.id, 'Student_Summary.pdf');
+  return summaryFiles.length ? readFileBuffer(summaryFiles[0].id) : null;
+}
+
 // POST /api/students/:studentKey/recover-meta
 // Reads the student's Summary PDF, OCRs it, asks Claude to reconstruct the meta JSON.
 // Returns { success: true, recovered: {...}, warning: "..." } — does NOT write yet.
 router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, res) => {
   try {
     const folderKey = cleanFolderKey(req.params.studentKey);
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-    if (!stuDir) {
-      return res.status(404).json({ success: false, error: `Student folder "${folderKey}" not found` });
+    const ref = await resolveStudent(folderKey);
+    if (!ref) {
+      return res.status(404).json({ success: false, error: `Student "${folderKey}" not found` });
     }
 
-    // Locate Student_Summary.pdf — prefer Others/, fall back to root
-    const othersDir = await findFolderByName(stuDir.id, 'Others');
-    const candidates = othersDir
-      ? await findFilesByName(othersDir.id, 'Student_Summary.pdf')
-      : [];
-    const summaryFiles = candidates.length > 0
-      ? candidates
-      : await findFilesByName(stuDir.id, 'Student_Summary.pdf');
-
-    if (summaryFiles.length === 0) {
-      return res.status(404).json({ success: false, error: 'Student_Summary.pdf not found in student folder' });
+    const pdfBuf = await readSummaryPdf(ref);
+    if (!pdfBuf) {
+      return res.status(404).json({ success: false, error: 'Student_Summary.pdf not found for this student' });
     }
-
-    const pdfBuf = await readFileBuffer(summaryFiles[0].id);
 
     // OCR via Google Drive — upload PDF as Google Doc, export as text
     const extractedText = await extractTextViaOcr(pdfBuf, 'application/pdf', `Recovery_${folderKey}`);
@@ -149,7 +154,7 @@ router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, re
     }
 
     // Warn if meta already has substantial data (accidental overwrite guard)
-    const { meta: existing } = await readStudentMeta(stuDir.id).catch(() => ({ meta: {} }));
+    const existing = await readMeta(ref).catch(() => ({}));
     const existingFieldCount = Object.keys(existing).length;
     const warning = existingFieldCount > 5
       ? `Existing meta has ${existingFieldCount} fields — confirm before overwriting`
@@ -174,12 +179,12 @@ router.post('/:studentKey/restore-meta', verifyJWT, requireStaff, async (req, re
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
     const folderKey = cleanFolderKey(req.params.studentKey);
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-    if (!stuDir) {
-      return res.status(404).json({ success: false, error: `Student folder "${folderKey}" not found` });
+    const ref = await resolveStudent(folderKey);
+    if (!ref) {
+      return res.status(404).json({ success: false, error: `Student "${folderKey}" not found` });
     }
 
-    await writeStudentMeta(stuDir.id, meta);
+    await writeMeta(ref, meta);
     studentsCache.clear();
 
     res.json({ success: true });

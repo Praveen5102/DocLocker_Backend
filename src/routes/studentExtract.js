@@ -1,7 +1,8 @@
 const express = require('express');
 const multer = require('multer');
 const jwt = require('jsonwebtoken');
-const { ROOT_FOLDER_ID, sanitize, buildFolderKey, findFolderByName } = require('../services/drive');
+const { sanitize, buildFolderKey } = require('../services/drive');
+const { resolveStudent } = require('../services/studentStore');
 const { logAudit } = require('../services/auditLog');
 const {
   readDocument, summarizeResult, toLegacyParsed, ReaderError, READER_MIME_TYPES,
@@ -32,8 +33,8 @@ function staffFromRequest(req) {
 // studentIdentifier, subFolder, sourceFile.
 // Reads an already-uploaded ID/certificate with our own model and returns
 // structured fields for auto-fill and identity checks. Students are
-// validated the same way as /api/student-upload (name + identifier, folder
-// must already exist), so this can't be used anonymously.
+// validated the same way as /api/student-upload (name + identifier, the
+// student must already exist), so this can't be used anonymously.
 // Aadhaar is always read without consent, i.e. the number comes back masked.
 router.post('/', upload.array('files', 4), async (req, res) => {
   try {
@@ -49,8 +50,7 @@ router.post('/', upload.array('files', 4), async (req, res) => {
         return res.status(400).json({ success: false, error: 'Missing or invalid identifier' });
       }
       const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
-      const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-      if (!stuDir) {
+      if (!(await resolveStudent(folderKey))) {
         return res.status(404).json({ success: false, error: 'Student not found. Please complete registration first.' });
       }
     }

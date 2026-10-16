@@ -1,13 +1,15 @@
 const express = require('express');
 const multer  = require('multer');
 const {
-  ROOT_FOLDER_ID, sanitize, buildFolderKey, cleanFolderKey, folderKeyDisplayName,
-  getOrCreate, findFolderByName, trashFilesByNameExcept, uploadBuffer,
+  sanitize, buildFolderKey, cleanFolderKey, folderKeyDisplayName,
+  getOrCreate, trashFilesByNameExcept, uploadBuffer,
 } = require('../services/drive');
 const { convertToPdf, convertHtmlToPdf } = require('../services/pdf');
 const { parseDocument }                  = require('../services/documentParser');
 const { buildEligibilityHtml }           = require('../services/eligibilityReport');
-const { writeStudentMeta }               = require('../services/studentMeta');
+const {
+  resolveStudent, resolveOrCreateStudent, writeMeta, storeDocument,
+} = require('../services/studentStore');
 const { studentsCache }                  = require('../services/cache');
 const { verifyJWT, requireStaff }        = require('../middleware/auth');
 const { logAudit }                       = require('../services/auditLog');
@@ -26,8 +28,83 @@ function auditTargetFor(studentName, studentIdentifier) {
   return sanitize(buildFolderKey((studentName || '').trim(), (studentIdentifier || '').trim()));
 }
 
+// Saves an uploaded (and already converted) document for either kind of
+// student. Railway students get an encrypted bucket copy; Drive students
+// keep the old flow. Either way the new copy is saved FIRST and only then
+// are older versions retired — a failure in between never leaves the
+// student without the document.
+async function saveUpload(ref, { subFolder, fileName, file, converted, uploadedBy }) {
+  const section = sanitize(subFolder);
+  const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
+  const { pdfBuffer, extractedText } = converted;
+
+  const finalBuffer   = pdfBuffer || file.buffer;
+  const finalMimeType = pdfBuffer ? 'application/pdf' : file.mimetype;
+  const finalFileName = pdfBuffer ? (cleanNameNoExt + '.pdf') : fileName;
+
+  let uploaded;
+  if (ref.kind === 'railway') {
+    const saved = await storeDocument(ref, {
+      section, fileName: finalFileName, mimeType: finalMimeType, buffer: finalBuffer,
+      uploadedBy, replaces: [fileName, cleanNameNoExt + '.pdf'],
+    });
+    uploaded = { id: saved.id, name: saved.name, webViewLink: null };
+  } else {
+    const subDir = await getOrCreate(ref.dir.id, section);
+    uploaded = await uploadBuffer(subDir.id, finalFileName, finalMimeType, finalBuffer);
+    await Promise.all([
+      trashFilesByNameExcept(subDir.id, fileName, uploaded.id),
+      trashFilesByNameExcept(subDir.id, cleanNameNoExt + '.pdf', uploaded.id),
+    ]);
+  }
+
+  let parsedData = null;
+  if (extractedText) {
+    const parsed = parseDocument({ subFolder: section, sourceFile: finalFileName, extractedText });
+    parsedData = { type: parsed.type, subFolder: section, sourceFile: finalFileName, fields: parsed.fields };
+  }
+
+  return { fileId: uploaded.id, webViewLink: uploaded.webViewLink || null, fileName: uploaded.name, parsedData };
+}
+
+// Saves one auto-generated report (Student_Summary.pdf / Eligibility_Report.pdf)
+// into the student's "Others" section, replacing the previous copy.
+async function saveGeneratedPdf(ref, fileName, buffer, uploadedBy) {
+  if (ref.kind === 'railway') {
+    const saved = await storeDocument(ref, {
+      section: 'Others', fileName, mimeType: 'application/pdf', buffer, uploadedBy,
+    });
+    return { id: saved.id, webViewLink: null };
+  }
+  const othersDir = await getOrCreate(ref.dir.id, 'Others');
+  const uploaded = await uploadBuffer(othersDir.id, fileName, 'application/pdf', buffer);
+  await Promise.all([
+    trashFilesByNameExcept(ref.dir.id,   fileName, uploaded.id),
+    trashFilesByNameExcept(othersDir.id, fileName, uploaded.id),
+  ]);
+  return uploaded;
+}
+
+// Summary + (optional) eligibility report; the eligibility report is
+// best-effort and never fails the summary save.
+async function saveReports(ref, summaryBuf, eligBuf, uploadedBy) {
+  const [summaryUploaded, eligUpload] = await Promise.all([
+    saveGeneratedPdf(ref, 'Student_Summary.pdf', summaryBuf, uploadedBy),
+    eligBuf
+      ? saveGeneratedPdf(ref, 'Eligibility_Report.pdf', eligBuf, uploadedBy)
+          .catch((e) => { console.error('Eligibility upload failed:', e.message); return null; })
+      : Promise.resolve(null),
+  ]);
+  return {
+    success: true,
+    fileId: summaryUploaded.id,
+    webViewLink: summaryUploaded.webViewLink || null,
+    ...(eligUpload && { eligibilityReport: { fileId: eligUpload.id, webViewLink: eligUpload.webViewLink || null } }),
+  };
+}
+
 // POST /api/upload
-// Returns parsedData in response — frontend holds this, no JSON saved to Drive
+// Returns parsedData in response — frontend holds this, no JSON saved
 router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (req, res) => {
   try {
     const { studentName, subFolder, fileName } = req.body;
@@ -39,37 +116,14 @@ router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (re
 
     const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
 
-    // Run folder chain creation and PDF conversion concurrently — independent of each other
-    const [subDir, { pdfBuffer, extractedText }] = await Promise.all([
-      (async () => {
-        const stuDir = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
-        return getOrCreate(stuDir.id, sanitize(subFolder));
-      })(),
+    // Student lookup and PDF conversion are independent — run them together.
+    const [ref, converted] = await Promise.all([
+      resolveOrCreateStudent(cleanFolderKey(studentName)),
       convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr }),
     ]);
 
-    let finalBuffer   = pdfBuffer || file.buffer;
-    let finalMimeType = pdfBuffer ? 'application/pdf' : file.mimetype;
-    let finalFileName = pdfBuffer ? (cleanNameNoExt + '.pdf') : fileName;
-
-    // Upload the new file FIRST, then clean up old versions — excluding the
-    // file we just uploaded, since it always shares one of the two names
-    // being cleaned up. Trashing old copies before the upload risked leaving
-    // the student with NO document at all if the upload step then failed.
-    const uploaded = await uploadBuffer(subDir.id, finalFileName, finalMimeType, finalBuffer);
-
-    await Promise.all([
-      trashFilesByNameExcept(subDir.id, fileName, uploaded.id),
-      trashFilesByNameExcept(subDir.id, cleanNameNoExt + '.pdf', uploaded.id),
-    ]);
-
-    let parsedData = null;
-    if (extractedText) {
-      const parsed = parseDocument({ subFolder: sanitize(subFolder), sourceFile: finalFileName, extractedText });
-      parsedData = { type: parsed.type, subFolder: sanitize(subFolder), sourceFile: finalFileName, fields: parsed.fields };
-    }
-
-    res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink, fileName: uploaded.name, parsedData });
+    const result = await saveUpload(ref, { subFolder, fileName, file, converted, uploadedBy: req.admin.name });
+    res.json({ success: true, ...result });
   } catch (err) {
     console.error('Upload error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -86,11 +140,11 @@ router.post('/meta', verifyJWT, requireStaff, async (req, res) => {
     try { metaObj = JSON.parse(metaJson); }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
-    const stuDir = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
-    const file   = await writeStudentMeta(stuDir.id, metaObj);
+    const ref  = await resolveOrCreateStudent(cleanFolderKey(studentName));
+    const file = await writeMeta(ref, metaObj);
 
     studentsCache.clear();
-    res.json({ success: true, fileId: file.id });
+    res.json({ success: true, ...(file && file.id && { fileId: file.id }) });
   } catch (err) {
     console.error('saveMeta error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -105,16 +159,14 @@ router.post('/summary', verifyJWT, requireStaff, async (req, res) => {
     const { studentName, htmlContent, documents = [] } = req.body;
     if (!studentName || !htmlContent) return res.status(400).json({ success: false, error: 'Missing studentName or htmlContent' });
 
-    const dispName  = folderKeyDisplayName(studentName);
-    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
-    const othersDir = await getOrCreate(stuDir.id, 'Others');
+    const dispName = folderKeyDisplayName(studentName);
+    const ref      = await resolveOrCreateStudent(cleanFolderKey(studentName));
 
-    // Build eligibility HTML synchronously (no Drive I/O)
     let eligHtml = null;
     try { eligHtml = buildEligibilityHtml(dispName, documents); }
     catch (e) { console.error('Eligibility HTML build failed:', e.message); }
 
-    // Convert both PDFs concurrently — no Drive writes yet, nothing to lose here.
+    // Convert both PDFs concurrently — nothing is saved yet, nothing to lose.
     const [summaryBuf, eligBuf] = await Promise.all([
       convertHtmlToPdf(htmlContent, dispName),
       eligHtml
@@ -123,34 +175,7 @@ router.post('/summary', verifyJWT, requireStaff, async (req, res) => {
         : Promise.resolve(null),
     ]);
 
-    // Upload both new PDFs FIRST, then clean up old copies — excluding the
-    // new files — so a failed cleanup step never leaves the student without
-    // a summary (previously trashed old copies before uploading the new one).
-    const [summaryUploaded, eligUpload] = await Promise.all([
-      uploadBuffer(othersDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf),
-      eligBuf
-        ? uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf)
-            .catch((e) => { console.error('Eligibility upload failed:', e.message); return null; })
-        : Promise.resolve(null),
-    ]);
-
-    await Promise.all([
-      trashFilesByNameExcept(stuDir.id,    'Student_Summary.pdf', summaryUploaded.id),
-      trashFilesByNameExcept(othersDir.id, 'Student_Summary.pdf', summaryUploaded.id),
-      eligUpload ? trashFilesByNameExcept(stuDir.id,    'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
-      eligUpload ? trashFilesByNameExcept(othersDir.id, 'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
-    ]);
-
-    const eligibilityReport = eligUpload
-      ? { fileId: eligUpload.id, webViewLink: eligUpload.webViewLink }
-      : null;
-
-    res.json({
-      success: true,
-      fileId: summaryUploaded.id,
-      webViewLink: summaryUploaded.webViewLink,
-      ...(eligibilityReport && { eligibilityReport }),
-    });
+    res.json(await saveReports(ref, summaryBuf, eligBuf, req.admin.name));
   } catch (err) {
     console.error('saveSummaryPdf error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -164,20 +189,13 @@ router.post('/eligibility-report', verifyJWT, requireStaff, async (req, res) => 
     const { studentName, documents = [] } = req.body;
     if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });
 
-    const dispName  = folderKeyDisplayName(studentName);
-    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), cleanFolderKey(studentName));
-    const othersDir = await getOrCreate(stuDir.id, 'Others');
-    const html      = buildEligibilityHtml(dispName, documents);
-    const pdfBuf    = await convertHtmlToPdf(html, dispName + '_Elig');
+    const dispName = folderKeyDisplayName(studentName);
+    const ref      = await resolveOrCreateStudent(cleanFolderKey(studentName));
+    const html     = buildEligibilityHtml(dispName, documents);
+    const pdfBuf   = await convertHtmlToPdf(html, dispName + '_Elig');
 
-    // Upload first, then clean up old copies excluding the new file.
-    const uploaded = await uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', pdfBuf);
-    await Promise.all([
-      trashFilesByNameExcept(stuDir.id,    'Eligibility_Report.pdf', uploaded.id),
-      trashFilesByNameExcept(othersDir.id, 'Eligibility_Report.pdf', uploaded.id),
-    ]);
-
-    res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink });
+    const uploaded = await saveGeneratedPdf(ref, 'Eligibility_Report.pdf', pdfBuf, req.admin.name);
+    res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink || null });
   } catch (err) {
     console.error('eligibilityReport error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -185,9 +203,9 @@ router.post('/eligibility-report', verifyJWT, requireStaff, async (req, res) => 
 });
 
 // ── Student self-service upload (no JWT — validated by name + identifier) ─────
-// Security: the student folder must ALREADY EXIST (created via /api/student-meta
-// during registration). findFolderByName returns 404 if the folder doesn't exist,
-// which prevents unauthenticated callers from creating arbitrary Drive folders.
+// Security: the student must ALREADY EXIST (created via /api/student-meta
+// during registration). resolveStudent never creates anything, which
+// prevents unauthenticated callers from creating arbitrary students.
 router.post('/student-upload', upload.single('file'), async (req, res) => {
   try {
     const { studentName, studentIdentifier, subFolder, fileName } = req.body;
@@ -207,45 +225,25 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
     const cleanNameNoExt = fileName.replace(/\.[^/.]+$/, '');
     const skipOcr = req.body.skipOcr === '1';
 
-    // Folder lookup + PDF conversion run concurrently.
-    // findFolderByName returns null if the folder doesn't exist (student not registered yet).
-    const [stuDir, { pdfBuffer, extractedText }] = await Promise.all([
-      findFolderByName(ROOT_FOLDER_ID(), folderKey),
+    const [ref, converted] = await Promise.all([
+      resolveStudent(folderKey),
       convertToPdf(file.buffer, file.mimetype, cleanNameNoExt, { skipOcr }),
     ]);
 
-    if (!stuDir) {
+    if (!ref) {
       return res.status(404).json({ success: false, error: 'Student not found. Please complete registration first.' });
     }
 
-    const subDir = await getOrCreate(stuDir.id, sanitize(subFolder.trim()));
-
-    const finalBuffer   = pdfBuffer || file.buffer;
-    const finalMimeType = pdfBuffer ? 'application/pdf' : file.mimetype;
-    const finalFileName = pdfBuffer ? (cleanNameNoExt + '.pdf') : fileName;
-
-    // Upload the new file FIRST, then clean up old versions excluding it —
-    // a student's document must never disappear because a retry/failure hit
-    // between "trash the old one" and "upload the new one."
-    const uploaded = await uploadBuffer(subDir.id, finalFileName, finalMimeType, finalBuffer);
-
-    await Promise.all([
-      trashFilesByNameExcept(subDir.id, fileName, uploaded.id),
-      trashFilesByNameExcept(subDir.id, cleanNameNoExt + '.pdf', uploaded.id),
-    ]);
-
-    let parsedData = null;
-    if (extractedText) {
-      const parsed = parseDocument({ subFolder: sanitize(subFolder), sourceFile: finalFileName, extractedText });
-      parsedData = { type: parsed.type, subFolder: sanitize(subFolder), sourceFile: finalFileName, fields: parsed.fields };
-    }
+    const result = await saveUpload(ref, {
+      subFolder: subFolder.trim(), fileName, file, converted, uploadedBy: sanitize(studentName.trim()),
+    });
 
     logAudit({
       actor: sanitize(studentName.trim()), role: 'student', action: 'document.upload',
-      target: auditTargetFor(studentName, studentIdentifier), details: { subFolder: sanitize(subFolder), fileName: uploaded.name },
+      target: auditTargetFor(studentName, studentIdentifier), details: { subFolder: sanitize(subFolder), fileName: result.fileName },
     });
 
-    res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink, fileName: uploaded.name, parsedData });
+    res.json({ success: true, ...result });
   } catch (err) {
     console.error('student-upload error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -286,54 +284,27 @@ router.post('/student-summary', upload.single('summaryPdf'), async (req, res) =>
     const dispName  = sanitize(studentName.trim());
     const folderKey = buildFolderKey(dispName, studentIdentifier.trim());
 
-    // getOrCreate — folder should already exist (meta save runs first), but
-    // create it defensively so a summary save never fails on that alone.
-    const stuDir    = await getOrCreate(ROOT_FOLDER_ID(), folderKey);
-    const othersDir = await getOrCreate(stuDir.id, 'Others');
+    // The student should already exist (meta save runs first), but create
+    // defensively so a summary save never fails on that alone.
+    const ref = await resolveOrCreateStudent(folderKey);
 
     let eligHtml = null;
     try { eligHtml = buildEligibilityHtml(dispName, documents); }
     catch (e) { console.error('Eligibility HTML build failed:', e.message); }
 
-    const [summaryBuf, eligBuf] = await Promise.all([
-      Promise.resolve(req.file.buffer),
-      eligHtml
-        ? convertHtmlToPdf(eligHtml, dispName + '_Elig')
-            .catch((e) => { console.error('Eligibility PDF convert failed:', e.message); return null; })
-        : Promise.resolve(null),
-    ]);
-
-    // Upload the new PDFs FIRST, then clean up old copies excluding them.
-    const [summaryUploaded, eligUpload] = await Promise.all([
-      uploadBuffer(othersDir.id, 'Student_Summary.pdf', 'application/pdf', summaryBuf),
-      eligBuf
-        ? uploadBuffer(othersDir.id, 'Eligibility_Report.pdf', 'application/pdf', eligBuf)
-            .catch((e) => { console.error('Eligibility upload failed:', e.message); return null; })
-        : Promise.resolve(null),
-    ]);
-
-    await Promise.all([
-      trashFilesByNameExcept(stuDir.id,    'Student_Summary.pdf', summaryUploaded.id),
-      trashFilesByNameExcept(othersDir.id, 'Student_Summary.pdf', summaryUploaded.id),
-      eligUpload ? trashFilesByNameExcept(stuDir.id,    'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
-      eligUpload ? trashFilesByNameExcept(othersDir.id, 'Eligibility_Report.pdf', eligUpload.id) : Promise.resolve(),
-    ]);
-
-    const eligibilityReport = eligUpload
-      ? { fileId: eligUpload.id, webViewLink: eligUpload.webViewLink }
+    const eligBuf = eligHtml
+      ? await convertHtmlToPdf(eligHtml, dispName + '_Elig')
+          .catch((e) => { console.error('Eligibility PDF convert failed:', e.message); return null; })
       : null;
+
+    const response = await saveReports(ref, req.file.buffer, eligBuf, dispName);
 
     logAudit({
       actor: dispName, role: 'student', action: 'summary.generate',
       target: auditTargetFor(studentName, studentIdentifier), details: null,
     });
 
-    res.json({
-      success: true,
-      fileId: summaryUploaded.id,
-      webViewLink: summaryUploaded.webViewLink,
-      ...(eligibilityReport && { eligibilityReport }),
-    });
+    res.json(response);
   } catch (err) {
     console.error('student-summary error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -341,7 +312,9 @@ router.post('/student-summary', upload.single('summaryPdf'), async (req, res) =>
 });
 
 // POST /api/student-meta — student self-service meta save (no JWT)
-// Uses getOrCreate so it creates the folder for brand-new students too.
+// Creates the student on first save: on Railway for brand-new students,
+// in Drive only if Railway storage isn't configured. A student who already
+// has a Drive folder keeps being saved there.
 router.post('/student-meta', async (req, res) => {
   try {
     const { studentName, studentIdentifier, metaJson } = req.body;
@@ -361,17 +334,13 @@ router.post('/student-meta', async (req, res) => {
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
     const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
-
-    // getOrCreate — creates the root student folder for first-time students.
-    // Locked internally against the double-submit race that used to create
-    // duplicate student folders for the same registration.
-    const stuDir = await getOrCreate(ROOT_FOLDER_ID(), folderKey);
-    await writeStudentMeta(stuDir.id, metaObj);
+    const ref = await resolveOrCreateStudent(folderKey);
+    await writeMeta(ref, metaObj);
 
     studentsCache.clear();
     logAudit({
       actor: sanitize(studentName.trim()), role: 'student', action: 'student.save',
-      target: auditTargetFor(studentName, studentIdentifier), details: null,
+      target: auditTargetFor(studentName, studentIdentifier), details: { storage: ref.kind },
     });
     res.json({ success: true });
   } catch (err) {

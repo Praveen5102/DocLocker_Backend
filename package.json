@@ -5,13 +5,20 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js"
+    "dev": "node --watch src/index.js",
+    "db:dev": "node scripts/dev-db.mjs",
+    "db:migrate": "node scripts/migrate.js",
+    "test:storage": "node scripts/smoke-storage.js",
+    "test:students": "node scripts/smoke-railway-students.js",
+    "backup": "node scripts/backup.js",
+    "backup:verify": "node scripts/backup.js verify"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
+    "@aws-sdk/client-s3": "^3.1152.0",
     "archiver": "^6.0.2",
     "bcryptjs": "^3.0.3",
     "compression": "^1.8.1",
@@ -23,6 +30,10 @@
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
-    "pdf-lib": "^1.17.1"
+    "pdf-lib": "^1.17.1",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "embedded-postgres": "^18.4.0-beta.17"
   }
 }

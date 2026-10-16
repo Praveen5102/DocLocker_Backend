@@ -1,9 +1,11 @@
 const express = require('express');
 const archiver = require('archiver');
 const {
-  ROOT_FOLDER_ID, sanitize, buildFolderKey, findFolderByName, listAllFilesRecursive, readFileBuffer,
+  sanitize, buildFolderKey, listAllFilesRecursive, readFileBuffer,
 } = require('../services/drive');
-const { readStudentMeta, writeStudentMeta } = require('../services/studentMeta');
+const {
+  resolveStudent, readMeta, updateMeta, listDocuments, readDocumentBytes,
+} = require('../services/studentStore');
 const { verifyJWT, verifyJWTFlexible, requireStaff, requireSuperAdmin } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
@@ -41,6 +43,22 @@ function validateDisbursement(disbursement) {
 // Internal files that should never be exposed to a banker, regardless of view.
 const EXCLUDED_FILENAMES = new Set(['student_meta.json', 'eligibility_report.pdf']);
 
+const bankerHasAccess = (meta, bankerName) => new Set(meta.sharedBankers || []).has(bankerName);
+
+// Visible documents for either kind of student, as
+// [{ id, name, mimeType, size, group }] — group is the section/subfolder.
+async function visibleFiles(ref) {
+  const files = ref.kind === 'railway'
+    ? (await listDocuments(ref)).map((d) => ({ id: d.id, name: d.name, mimeType: d.mimeType, size: d.size, group: d.section }))
+    : (await listAllFilesRecursive(ref.dir.id)).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType, size: f.size, group: f.relativePath }));
+  return files.filter((f) => !EXCLUDED_FILENAMES.has(String(f.name).toLowerCase()));
+}
+
+async function fileBytes(ref, file) {
+  if (ref.kind === 'railway') return (await readDocumentBytes(file.id)).buffer;
+  return readFileBuffer(file.id);
+}
+
 // PUT /api/students/banker-access — staff only (superadmin/advisor)
 // Body: { studentName, studentIdentifier, bankerName, grant: boolean }
 //
@@ -57,14 +75,13 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
     }
 
     const folderKey = sanitize(buildFolderKey(studentName, studentIdentifier || ''));
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-    if (!stuDir) {
-      return res.json({ success: false, error: `Student folder "${folderKey}" not found in Drive` });
+    const ref = await resolveStudent(folderKey);
+    if (!ref) {
+      return res.json({ success: false, error: `Student "${folderKey}" not found` });
     }
 
-    const { meta } = await readStudentMeta(stuDir.id);
-
     if (grant && req.admin.role === 'advisor') {
+      const meta = await readMeta(ref);
       if ((meta.sharedBankers || []).includes(bankerName)) {
         return res.json({ success: true, alreadyShared: true, sharedBankers: meta.sharedBankers });
       }
@@ -81,12 +98,12 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
       return res.json({ success: true, pending: true, request });
     }
 
-    const current = new Set(meta.sharedBankers || []);
-    if (grant) current.add(bankerName);
-    else current.delete(bankerName);
-    meta.sharedBankers = Array.from(current);
-
-    await writeStudentMeta(stuDir.id, meta);
+    const meta = await updateMeta(ref, (m) => {
+      const current = new Set(m.sharedBankers || []);
+      if (grant) current.add(bankerName);
+      else current.delete(bankerName);
+      m.sharedBankers = Array.from(current);
+    });
     studentsCache.clear();
     logAudit({
       actor: req.admin.name, role: req.admin.role,
@@ -132,16 +149,16 @@ router.post('/banker-access-requests/:id/approve', verifyJWT, requireSuperAdmin,
       return res.status(409).json({ success: false, error: `Request has already been ${request.status}` });
     }
 
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), request.studentKey);
-    if (!stuDir) {
-      return res.status(404).json({ success: false, error: 'Student folder not found — the request could not be applied' });
+    const ref = await resolveStudent(request.studentKey);
+    if (!ref) {
+      return res.status(404).json({ success: false, error: 'Student not found — the request could not be applied' });
     }
 
-    const { meta } = await readStudentMeta(stuDir.id);
-    const current = new Set(meta.sharedBankers || []);
-    current.add(request.bankerName);
-    meta.sharedBankers = Array.from(current);
-    await writeStudentMeta(stuDir.id, meta);
+    const meta = await updateMeta(ref, (m) => {
+      const current = new Set(m.sharedBankers || []);
+      current.add(request.bankerName);
+      m.sharedBankers = Array.from(current);
+    });
     studentsCache.clear();
 
     logAudit({
@@ -186,26 +203,20 @@ router.post('/banker-access-requests/:id/reject', verifyJWT, requireSuperAdmin, 
 // section, excluding internal-only files.
 router.get('/:studentKey/files', verifyJWT, async (req, res) => {
   try {
-    const folderKey = sanitize(req.params.studentKey);
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-    if (!stuDir) {
-      return res.json({ success: false, error: 'Student folder not found' });
+    const ref = await resolveStudent(req.params.studentKey);
+    if (!ref) {
+      return res.json({ success: false, error: 'Student not found' });
     }
 
-    if (req.admin.role === 'banker') {
-      const { meta } = await readStudentMeta(stuDir.id);
-      const shared = new Set(meta.sharedBankers || []);
-      if (!shared.has(req.admin.name)) {
-        return res.status(403).json({ success: false, error: 'You do not have access to this student' });
-      }
+    if (req.admin.role === 'banker' && !bankerHasAccess(await readMeta(ref), req.admin.name)) {
+      return res.status(403).json({ success: false, error: 'You do not have access to this student' });
     }
 
-    const allFiles = await listAllFilesRecursive(stuDir.id);
-    const visible = allFiles.filter((f) => !EXCLUDED_FILENAMES.has(f.name.toLowerCase()));
+    const visible = await visibleFiles(ref);
 
     const groups = {};
     for (const f of visible) {
-      const group = f.relativePath || 'Other';
+      const group = f.group || 'Other';
       if (!groups[group]) groups[group] = [];
       groups[group].push({ id: f.id, name: f.name, mimeType: f.mimeType, size: f.size });
     }
@@ -237,31 +248,31 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
     }
 
     const folderKey = sanitize(req.params.studentKey);
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-    if (!stuDir) {
-      return res.status(404).json({ success: false, error: `Student folder "${folderKey}" not found` });
+    const ref = await resolveStudent(folderKey);
+    if (!ref) {
+      return res.status(404).json({ success: false, error: `Student "${folderKey}" not found` });
     }
 
-    const { meta } = await readStudentMeta(stuDir.id);
-
-    // Bankers may only update students they have been granted access to
-    if (req.admin.role === 'banker') {
-      const shared = new Set(meta.sharedBankers || []);
-      if (!shared.has(req.admin.name)) {
-        return res.status(403).json({ success: false, error: 'You do not have access to this student' });
-      }
+    const ACCESS_DENIED = Symbol('access denied');
+    const meta = await updateMeta(ref, (m) => {
+      // Bankers may only update students they have been granted access to.
+      // Checked inside the update so a revoke can't slip in between.
+      if (req.admin.role === 'banker' && !bankerHasAccess(m, req.admin.name)) throw ACCESS_DENIED;
+      m.loanStatus = loanStatus;
+      m.loanRemark = REMARK_REQUIRED_STATUSES.has(loanStatus) ? String(loanRemark).trim() : '';
+      m.loanStatusUpdatedBy = req.admin.name;
+      m.loanStatusUpdatedAt = new Date().toISOString();
+      // Only overwritten when a new disbursal is recorded — an older disbursement
+      // record is left in place if the status is later moved off "disbursed",
+      // so it still shows as history rather than disappearing.
+      if (disbursementValues) m.loanDisbursement = disbursementValues;
+    }).catch((err) => {
+      if (err === ACCESS_DENIED) return null;
+      throw err;
+    });
+    if (!meta) {
+      return res.status(403).json({ success: false, error: 'You do not have access to this student' });
     }
-
-    meta.loanStatus = loanStatus;
-    meta.loanRemark = REMARK_REQUIRED_STATUSES.has(loanStatus) ? String(loanRemark).trim() : '';
-    meta.loanStatusUpdatedBy = req.admin.name;
-    meta.loanStatusUpdatedAt = new Date().toISOString();
-    // Only overwritten when a new disbursal is recorded — an older disbursement
-    // record is left in place if the status is later moved off "disbursed",
-    // so it still shows as history rather than disappearing.
-    if (disbursementValues) meta.loanDisbursement = disbursementValues;
-
-    await writeStudentMeta(stuDir.id, meta);
     studentsCache.clear();
 
     logAudit({
@@ -281,21 +292,16 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
 router.get('/:studentKey/files/zip', verifyJWTFlexible, async (req, res) => {
   try {
     const folderKey = sanitize(req.params.studentKey);
-    const stuDir = await findFolderByName(ROOT_FOLDER_ID(), folderKey);
-    if (!stuDir) {
-      return res.status(404).json({ success: false, error: 'Student folder not found' });
+    const ref = await resolveStudent(folderKey);
+    if (!ref) {
+      return res.status(404).json({ success: false, error: 'Student not found' });
     }
 
-    if (req.admin.role === 'banker') {
-      const { meta } = await readStudentMeta(stuDir.id);
-      const shared = new Set(meta.sharedBankers || []);
-      if (!shared.has(req.admin.name)) {
-        return res.status(403).json({ success: false, error: 'You do not have access to this student' });
-      }
+    if (req.admin.role === 'banker' && !bankerHasAccess(await readMeta(ref), req.admin.name)) {
+      return res.status(403).json({ success: false, error: 'You do not have access to this student' });
     }
 
-    const allFiles = await listAllFilesRecursive(stuDir.id);
-    const visible = allFiles.filter((f) => !EXCLUDED_FILENAMES.has(f.name.toLowerCase()));
+    const visible = await visibleFiles(ref);
 
     if (visible.length === 0) {
       return res.status(404).json({ success: false, error: 'No documents found' });
@@ -316,8 +322,8 @@ router.get('/:studentKey/files/zip', verifyJWTFlexible, async (req, res) => {
     // doesn't abort the whole zip.
     for (const f of visible) {
       try {
-        const buf = await readFileBuffer(f.id);
-        const entryPath = f.relativePath ? `${f.relativePath}/${f.name}` : f.name;
+        const buf = await fileBytes(ref, f);
+        const entryPath = f.group ? `${f.group}/${f.name}` : f.name;
         archive.append(buf, { name: entryPath });
       } catch (fileErr) {
         console.warn(`zip: skipping "${f.name}" — ${fileErr.message}`);
