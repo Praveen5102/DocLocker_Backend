@@ -5,11 +5,12 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
+    "dev": "node --watch-path=src src/index.js",
     "db:dev": "node scripts/dev-db.mjs",
     "db:migrate": "node scripts/migrate.js",
     "test:storage": "node scripts/smoke-storage.js",
     "test:students": "node scripts/smoke-railway-students.js",
+    "migrate:drive": "node scripts/migrate-drive-to-railway.js",
     "backup": "node scripts/backup.js",
     "backup:verify": "node scripts/backup.js verify"
   },

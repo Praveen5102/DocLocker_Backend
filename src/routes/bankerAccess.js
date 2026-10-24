@@ -1,12 +1,27 @@
 const express = require('express');
 const archiver = require('archiver');
 const {
-  sanitize, buildFolderKey, listAllFilesRecursive, readFileBuffer,
+  sanitize, buildFolderKey,
 } = require('../services/drive');
 const {
-  resolveStudent, readMeta, updateMeta, listDocuments, readDocumentBytes,
+  resolveStudent, readMeta, updateMeta,
 } = require('../services/studentStore');
-const { verifyJWT, verifyJWTOrTicket, requireStaff, requireSuperAdmin } = require('../middleware/auth');
+const { verifyJWT, verifyJWTOrTicket, requireStaff, requireCompanyAdmin } = require('../middleware/auth');
+const { canSeeStudent, staffStudent } = require('../services/access');
+const { visibleFiles, fileBytes } = require('../services/studentFiles');
+const { findByName } = require('../services/accounts');
+const { canAccessOrg, ownerOrgId } = require('../services/tenantScope');
+
+// A request (or lender) is visible to the caller only inside their companies.
+async function requestVisible(r) {
+  return canAccessOrg(r.orgId || (await ownerOrgId()));
+}
+
+// The lender must be an active lender of the student's own company.
+async function lenderOf(ref, bankerName) {
+  const lender = await findByName(bankerName);
+  return lender && lender.role === 'banker' && lender.status === 'active' && lender.orgId === ref.orgId ? lender : null;
+}
 const { issueTicket } = require('../services/fileTickets');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
@@ -41,29 +56,12 @@ function validateDisbursement(disbursement) {
   return { values };
 }
 
-// Internal files that should never be exposed to a banker, regardless of view.
-const EXCLUDED_FILENAMES = new Set(['student_meta.json', 'eligibility_report.pdf']);
-
 const bankerHasAccess = (meta, bankerName) => new Set(meta.sharedBankers || []).has(bankerName);
 
-// Visible documents for either kind of student, as
-// [{ id, name, mimeType, size, group }] — group is the section/subfolder.
-async function visibleFiles(ref) {
-  const files = ref.kind === 'railway'
-    ? (await listDocuments(ref)).map((d) => ({ id: d.id, name: d.name, mimeType: d.mimeType, size: d.size, group: d.section }))
-    : (await listAllFilesRecursive(ref.dir.id)).map((f) => ({ id: f.id, name: f.name, mimeType: f.mimeType, size: f.size, group: f.relativePath }));
-  return files.filter((f) => !EXCLUDED_FILENAMES.has(String(f.name).toLowerCase()));
-}
-
-async function fileBytes(ref, file) {
-  if (ref.kind === 'railway') return (await readDocumentBytes(file.id)).buffer;
-  return readFileBuffer(file.id);
-}
-
-// PUT /api/students/banker-access — staff only (superadmin/advisor)
+// PUT /api/students/banker-access — staff only (superadmin/admin/advisor)
 // Body: { studentName, studentIdentifier, bankerName, grant: boolean }
 //
-// Superadmins grant/revoke immediately, same as always. Advisors can still
+// Superadmins and company admins grant/revoke immediately. Advisors can still
 // revoke immediately (removing exposure needs no review) but a NEW grant from
 // an advisor is only a *request* — it lands in the pending queue for a
 // superadmin to approve, and student.sharedBankers is left untouched until
@@ -76,9 +74,14 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
     }
 
     const folderKey = sanitize(buildFolderKey(studentName, studentIdentifier || ''));
-    const ref = await resolveStudent(folderKey);
-    if (!ref) {
-      return res.json({ success: false, error: `Student "${folderKey}" not found` });
+    let ref;
+    try {
+      ref = await staffStudent(req.admin, folderKey);
+    } catch {
+      return res.status(404).json({ success: false, error: 'Student not found' });
+    }
+    if (grant && !(await lenderOf(ref, bankerName))) {
+      return res.status(400).json({ success: false, error: 'That lender is not part of this student’s company' });
     }
 
     if (grant && req.admin.role === 'advisor') {
@@ -87,7 +90,7 @@ router.put('/banker-access', verifyJWT, requireStaff, async (req, res) => {
         return res.json({ success: true, alreadyShared: true, sharedBankers: meta.sharedBankers });
       }
       const { request, created } = await createBankerAccessRequest({
-        studentKey: folderKey, studentName, studentIdentifier: studentIdentifier || '', bankerName,
+        orgId: ref.orgId, studentKey: folderKey, studentName, studentIdentifier: studentIdentifier || '', bankerName,
         requestedBy: req.admin.name, requestedByRole: req.admin.role,
       });
       if (created) {
@@ -125,6 +128,8 @@ router.get('/banker-access-requests', verifyJWT, requireStaff, async (req, res) 
   try {
     const { status } = req.query;
     let requests = await listBankerAccessRequests();
+    const visible = await Promise.all(requests.map(requestVisible));
+    requests = requests.filter((_, i) => visible[i]);
     if (req.admin.role === 'advisor') {
       requests = requests.filter((r) => r.requestedBy === req.admin.name);
     }
@@ -137,13 +142,14 @@ router.get('/banker-access-requests', verifyJWT, requireStaff, async (req, res) 
   }
 });
 
-// POST /api/students/banker-access-requests/:id/approve — superadmin only.
+// POST /api/students/banker-access-requests/:id/approve — superadmin, or the
+// admin of the student's company.
 // Applies the grant the advisor asked for, exactly like the direct-grant
 // path above, then marks the request approved.
-router.post('/banker-access-requests/:id/approve', verifyJWT, requireSuperAdmin, async (req, res) => {
+router.post('/banker-access-requests/:id/approve', verifyJWT, requireCompanyAdmin, async (req, res) => {
   try {
     const { request, error } = await decideBankerAccessRequest(req.params.id, {
-      approve: true, decidedBy: req.admin.name,
+      approve: true, decidedBy: req.admin.name, visible: requestVisible,
     });
     if (error === 'not_found') return res.status(404).json({ success: false, error: 'Request not found' });
     if (error === 'already_decided') {
@@ -174,13 +180,14 @@ router.post('/banker-access-requests/:id/approve', verifyJWT, requireSuperAdmin,
   }
 });
 
-// POST /api/students/banker-access-requests/:id/reject — superadmin only.
+// POST /api/students/banker-access-requests/:id/reject — superadmin, or the
+// admin of the student's company.
 // Body (optional): { note } — shown to the advisor as the reason.
-router.post('/banker-access-requests/:id/reject', verifyJWT, requireSuperAdmin, async (req, res) => {
+router.post('/banker-access-requests/:id/reject', verifyJWT, requireCompanyAdmin, async (req, res) => {
   try {
     const { note } = req.body || {};
     const { request, error } = await decideBankerAccessRequest(req.params.id, {
-      approve: false, decidedBy: req.admin.name, note,
+      approve: false, decidedBy: req.admin.name, note, visible: requestVisible,
     });
     if (error === 'not_found') return res.status(404).json({ success: false, error: 'Request not found' });
     if (error === 'already_decided') {
@@ -209,7 +216,7 @@ router.get('/:studentKey/files', verifyJWT, async (req, res) => {
       return res.json({ success: false, error: 'Student not found' });
     }
 
-    if (req.admin.role === 'banker' && !bankerHasAccess(await readMeta(ref), req.admin.name)) {
+    if (!(await canSeeStudent(req.admin, ref))) {
       return res.status(403).json({ success: false, error: 'You do not have access to this student' });
     }
 
@@ -254,11 +261,17 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
       return res.status(404).json({ success: false, error: `Student "${folderKey}" not found` });
     }
 
+    if (!(await canSeeStudent(req.admin, ref))) {
+      return res.status(403).json({ success: false, error: 'You do not have access to this student' });
+    }
+
     const ACCESS_DENIED = Symbol('access denied');
+    let previousStatus = null;
     const meta = await updateMeta(ref, (m) => {
       // Bankers may only update students they have been granted access to.
       // Checked inside the update so a revoke can't slip in between.
       if (req.admin.role === 'banker' && !bankerHasAccess(m, req.admin.name)) throw ACCESS_DENIED;
+      previousStatus = m.loanStatus || 'pending';
       m.loanStatus = loanStatus;
       m.loanRemark = REMARK_REQUIRED_STATUSES.has(loanStatus) ? String(loanRemark).trim() : '';
       m.loanStatusUpdatedBy = req.admin.name;
@@ -278,7 +291,12 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
 
     logAudit({
       actor: req.admin.name, role: req.admin.role, action: 'loan_status.update', target: folderKey,
-      details: { loanStatus, ...(disbursementValues ? { disbursement: disbursementValues } : {}) },
+      // previousStatus lets the activity views show "from → to"
+      details: {
+        loanStatus, previousStatus,
+        ...(meta.loanRemark ? { remark: meta.loanRemark } : {}),
+        ...(disbursementValues ? { disbursement: disbursementValues } : {}),
+      },
     });
 
     res.json({ success: true, loanStatus: meta.loanStatus, loanRemark: meta.loanRemark, loanDisbursement: meta.loanDisbursement || null });
@@ -310,7 +328,7 @@ router.get('/:studentKey/files/zip', verifyJWTOrTicket('zip', (req) => req.param
       return res.status(404).json({ success: false, error: 'Student not found' });
     }
 
-    if (req.admin.role === 'banker' && !bankerHasAccess(await readMeta(ref), req.admin.name)) {
+    if (!(await canSeeStudent(req.admin, ref))) {
       return res.status(403).json({ success: false, error: 'You do not have access to this student' });
     }
 

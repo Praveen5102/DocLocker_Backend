@@ -7,7 +7,7 @@ const {
   resolveStudent, readMeta, writeMeta, findLatestDocument, readDocumentBytes,
 } = require('../services/studentStore');
 const { extractTextViaOcr } = require('../services/pdf');
-const { verifyJWT, requireStaff } = require('../middleware/auth');
+const { verifyJWT, requireCompanyAdmin } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 
 const router = express.Router();
@@ -106,7 +106,7 @@ async function readSummaryPdf(ref) {
 // POST /api/students/:studentKey/recover-meta
 // Reads the student's Summary PDF, OCRs it, asks Claude to reconstruct the meta JSON.
 // Returns { success: true, recovered: {...}, warning: "..." } — does NOT write yet.
-router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, res) => {
+router.post('/:studentKey/recover-meta', verifyJWT, requireCompanyAdmin, async (req, res) => {
   try {
     const folderKey = cleanFolderKey(req.params.studentKey);
     const ref = await resolveStudent(folderKey);
@@ -169,7 +169,7 @@ router.post('/:studentKey/recover-meta', verifyJWT, requireStaff, async (req, re
 
 // POST /api/students/:studentKey/restore-meta
 // Body: { metaJson: "..." } — writes confirmed recovered JSON as student_meta.json
-router.post('/:studentKey/restore-meta', verifyJWT, requireStaff, async (req, res) => {
+router.post('/:studentKey/restore-meta', verifyJWT, requireCompanyAdmin, async (req, res) => {
   try {
     const { metaJson } = req.body;
     if (!metaJson) return res.status(400).json({ success: false, error: 'Missing metaJson' });

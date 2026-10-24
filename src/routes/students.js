@@ -1,43 +1,22 @@
 const express = require('express');
-const { ROOT_FOLDER_ID, cleanFolderKey, listFolders, findFilesByName, findFolderByName, readJsonFile, deletePermanently } = require('../services/drive');
-const { verifyJWT, requireStaff } = require('../middleware/auth');
+const { ROOT_FOLDER_ID, cleanFolderKey, listFolders, readJsonFile, deletePermanently } = require('../services/drive');
+const { verifyJWT, requireCompanyAdmin, studentCompany } = require('../middleware/auth');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
 const {
-  listRailwayStudents, findRailwayStudentByIdentifier, resolveStudent, deleteRailwayStudent,
+  listRailwayStudents, resolveStudent, deleteRailwayStudent,
 } = require('../services/studentStore');
+const { includesOwner, ownerOrgId } = require('../services/tenantScope');
+const { parseIdentifier, locateStudent, findMetaFile, warmDriveContacts } = require('../services/studentLocator');
+const { canSeeMeta } = require('../services/access');
 
 const router = express.Router();
+warmDriveContacts();
 
-// student_meta.json now lives in the "Others" subfolder; older students may still
-// have it sitting at the folder root from before this change, so check both —
-// in parallel, to avoid doubling/tripling per-folder Drive round trips.
-// The auto-generated Student_Summary.pdf / Eligibility_Report.pdf live in that
-// same "Others" folder, so their lookup piggybacks on this same round trip
-// instead of costing the list view a second Drive call per student.
-async function findMetaFile(folderId) {
-  const [othersDir, rootFiles] = await Promise.all([
-    findFolderByName(folderId, 'Others'),
-    findFilesByName(folderId, 'student_meta.json'),
-  ]);
-  if (!othersDir) {
-    return { metaFiles: rootFiles, summaryFile: null, eligibilityFile: null };
-  }
-  const [inOthers, summaryFiles, eligibilityFiles] = await Promise.all([
-    findFilesByName(othersDir.id, 'student_meta.json'),
-    findFilesByName(othersDir.id, 'Student_Summary.pdf'),
-    findFilesByName(othersDir.id, 'Eligibility_Report.pdf'),
-  ]);
-  return {
-    metaFiles: inOthers.length > 0 ? inOthers : rootFiles,
-    summaryFile: summaryFiles[0] || null,
-    eligibilityFile: eligibilityFiles[0] || null,
-  };
-}
-
-// GET /api/students — list all (JWT required)
-// Bankers never receive the full list over the wire — only students they've
-// been explicitly granted access to, filtered server-side before responding.
+// GET /api/students — the students the caller may see (JWT required).
+// Scoped to the caller's company, then filtered server-side before anything
+// goes over the wire: staff get only students assigned to them, lenders only
+// students shared with them.
 router.get('/', verifyJWT, async (req, res) => {
   try {
     let students;
@@ -45,13 +24,19 @@ router.get('/', verifyJWT, async (req, res) => {
       students = studentsCache.data;
     } else {
       // New students live on Railway, everyone else in Drive — one list.
+      // Drive students all belong to Flyurdream.
+      const withDrive = await includesOwner();
+      const owner = withDrive ? { id: await ownerOrgId(), name: 'Flyurdream', slug: 'flyurdream' } : null;
       const [folders, railwayStudents] = await Promise.all([
-        listFolders(ROOT_FOLDER_ID()),
+        withDrive ? listFolders(ROOT_FOLDER_ID()) : [],
         listRailwayStudents(),
       ]);
+      // A Drive folder whose student has moved to Railway is only a backup
+      // copy now — listing it too would show the student twice.
+      const moved = new Set(railwayStudents.map((s) => s.studentKey));
       const driveStudents = await Promise.all(
-        folders.map(async (folder) => {
-          const obj = { name: folder.name, driveUrl: folder.webViewLink };
+        folders.filter((folder) => !moved.has(folder.name)).map(async (folder) => {
+          const obj = { name: folder.name, driveUrl: folder.webViewLink, company: owner };
           const { metaFiles, summaryFile, eligibilityFile } = await findMetaFile(folder.id);
           const summaryPdf = summaryFile
             ? { fileId: summaryFile.id, webViewLink: summaryFile.webViewLink, updatedAt: summaryFile.modifiedTime }
@@ -78,9 +63,7 @@ router.get('/', verifyJWT, async (req, res) => {
       studentsCache.set(students);
     }
 
-    if (req.admin.role === 'banker') {
-      students = students.filter((s) => (s.sharedBankers || []).includes(req.admin.name));
-    }
+    students = students.filter((s) => canSeeMeta(req.admin, s));
 
     res.json({ success: true, students });
   } catch (err) {
@@ -89,63 +72,23 @@ router.get('/', verifyJWT, async (req, res) => {
   }
 });
 
-// GET /api/students/find?identifier= — used by the student self-service portal
-// Warm cache: email/phone field match (0 Drive calls).
-// Cold / new student: folder name suffix match (1 Drive call, 0 meta reads).
-router.get('/find', async (req, res) => {
+// GET /api/students/find?identifier= — does an application exist for this
+// email / mobile number? Used by signup to stop duplicates. It never returns
+// the application itself: that needs the applicant's PIN (routes/applicant.js).
+router.get('/find', studentCompany, async (req, res) => {
   try {
-    const { identifier } = req.query;
-    if (!identifier || identifier.trim().length < 5) {
-      return res.status(400).json({ success: false, error: 'Missing or too-short identifier' });
-    }
-
-    const safeId = identifier.trim().replace(/[^a-zA-Z0-9@._+-]/g, '');
-
-    // 1. Warm cache — full meta is already in memory, return it all
-    if (studentsCache.isValid()) {
-      const hit = studentsCache.data.find((s) => s.email === safeId || s.phone === safeId);
-      if (hit) {
-        // Spread full meta so the portal can pre-populate all fields on resume
-        return res.json({ success: true, student: { ...hit } });
-      }
-      // Not in warm cache (new student) — fall through to Drive scan
-    }
-
-    // 2. New students on Railway — one indexed query.
-    const railwayHit = await findRailwayStudentByIdentifier(safeId);
-    if (railwayHit) return res.json({ success: true, student: railwayHit });
-
-    // 3. Cold / older student — match Drive folder name suffix (no meta reads for lookup)
-    // Try both @-preserved and sanitized suffix to handle folders created by different code paths
-    const suffix = `__${safeId}`;
-    const suffixSanitized = `__${safeId.replace(/[^a-zA-Z0-9 _\-.]/g, '_')}`;
-    const folders = await listFolders(ROOT_FOLDER_ID());
-    const match = folders.find(
-      (f) => f.name && (f.name.endsWith(suffix) || f.name.endsWith(suffixSanitized))
-    );
-
-    if (match) {
-      const displayName = match.name.split('__')[0] || match.name;
-      let studentData = { name: displayName, driveUrl: match.webViewLink };
-      // Read meta so the portal gets the full picture on resume
-      try {
-        const { metaFiles } = await findMetaFile(match.id);
-        if (metaFiles.length > 0) {
-          const meta = await readJsonFile(metaFiles[0].id);
-          studentData = { driveUrl: match.webViewLink, ...meta, name: meta.name || displayName };
-        }
-      } catch (_) {}
-      return res.json({ success: true, student: studentData });
-    }
-    res.json({ success: false, student: null });
+    const id = parseIdentifier(req.query.identifier);
+    if (!id) return res.status(400).json({ success: false, error: 'Enter the email or 10-digit mobile number you registered with' });
+    const found = await locateStudent(id, { viaCompanyLink: req.viaCompanyLink, companyId: req.companyId });
+    res.json({ success: true, exists: Boolean(found) });
   } catch (err) {
     console.error('findStudent error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
-// DELETE /api/students — permanently delete a student (staff only —
-// both superadmin and advisor pass requireStaff; only banker accounts are blocked).
+// DELETE /api/students — permanently delete a student. Company admins and
+// superadmin only; a company admin only ever reaches their own students.
 // Uses deletePermanently (hard delete), NOT trash — trashFile() only moves the
 // folder into Drive's Trash: recoverable for 30 days and still counted against
 // storage quota, so the student's data was never actually gone.
@@ -163,7 +106,7 @@ router.get('/find', async (req, res) => {
 // even though nothing was removed from Drive — the student reappeared on
 // the next refresh. Now it's a 404, so the caller knows the delete did not
 // happen and must not remove the row from its own list.
-router.delete('/', verifyJWT, requireStaff, async (req, res) => {
+router.delete('/', verifyJWT, requireCompanyAdmin, async (req, res) => {
   try {
     const { studentName, folderId, studentKey } = req.body;
 
@@ -180,7 +123,19 @@ router.delete('/', verifyJWT, requireStaff, async (req, res) => {
       return res.json({ success: true, deleted: 1 });
     }
 
+    // Drive students are Flyurdream's; a partner admin can't reach them.
+    if (!(await includesOwner())) {
+      return res.status(404).json({ success: false, error: 'Student not found — nothing was deleted.' });
+    }
+
     if (folderId) {
+      // Only a student folder (a direct child of the DocLocker root) may be
+      // deleted — never an arbitrary Drive id.
+      const studentFolders = await listFolders(ROOT_FOLDER_ID());
+      if (!studentFolders.some((f) => f.id === folderId)) {
+        studentsCache.clear();
+        return res.status(404).json({ success: false, error: 'Student not found — nothing was deleted. Refresh the list and try again.' });
+      }
       try {
         await deletePermanently(folderId);
       } catch (err) {

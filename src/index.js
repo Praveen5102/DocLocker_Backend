@@ -27,7 +27,9 @@ const compression  = require('compression');
 const authRoutes        = require('./routes/auth');
 const adminsRoutes      = require('./routes/admins');
 const advisorsRoutes    = require('./routes/advisors');
+const companiesRoutes   = require('./routes/companies');
 const studentsRoutes    = require('./routes/students');
+const applicantRoutes   = require('./routes/applicant');
 const filesRoutes       = require('./routes/files');
 const bankerAccessRoutes = require('./routes/bankerAccess');
 const fileProxyRoutes   = require('./routes/fileProxy');
@@ -134,7 +136,18 @@ const studentExtractLimiter = rateLimit({
   message: { success: false, error: 'Too many documents read in a short time, please wait a few minutes and try again.' },
 });
 
+// Applicant sign-in: PIN guesses are also locked per application
+// (services/applicantPins.js); this caps one device across applications.
+const applicantAuthLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many tries in a short time. Please wait a few minutes and try again.' },
+});
+
 app.use('/api/auth',              authLimiter);
+app.use(['/api/applicant/register', '/api/applicant/lookup', '/api/applicant/sign-in', '/api/applicant/create-pin'], applicantAuthLimiter);
 app.use('/api/upload',            uploadLimiter);
 app.use('/api/student-upload',    uploadLimiter);
 app.use('/api/student-meta',      apiLimiter);
@@ -150,6 +163,8 @@ app.get('/health', (_req, res) => res.json({ ok: true, ts: Date.now() }));
 app.use('/api/auth',     authRoutes);
 app.use('/api/admins',   adminsRoutes);
 app.use('/api/advisors', advisorsRoutes);
+app.use('/api/companies', companiesRoutes);
+app.use('/api/applicant', applicantRoutes);
 app.use('/api/students', studentsRoutes);
 app.use('/api/students', bankerAccessRoutes);
 app.use('/api/students', recoveryRoutes);

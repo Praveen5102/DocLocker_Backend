@@ -9,27 +9,18 @@ const { convertToPdf, convertHtmlToPdf } = require('../services/pdf');
 const { parseDocument }                  = require('../services/documentParser');
 const { buildEligibilityHtml }           = require('../services/eligibilityReport');
 const {
-  resolveStudent, resolveOrCreateStudent, writeMeta, storeDocument, listDocuments, readDocumentBytes,
+  resolveStudent, readMeta, writeMeta, storeDocument, listDocuments, readDocumentBytes,
 } = require('../services/studentStore');
 const { readerForSlot, slotBase, checkUpload } = require('../services/uploadGate');
 const { summarizeResult, toLegacyParsed } = require('../services/documentReader');
 const { studentsCache }                  = require('../services/cache');
-const { verifyJWT, requireStaff }        = require('../middleware/auth');
+const { verifyJWT, requireStaff, requireApplicant, scopedUpload } = require('../middleware/auth');
+const { staffStudent } = require('../services/access');
+const { mergeStudentMeta } = require('../services/protectedMeta');
 const { logAudit }                       = require('../services/auditLog');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
-
-// Canonical audit target for a student — matches bankerAccess.js's own
-// sanitize(buildFolderKey(...)) exactly, computed fresh from the raw name/
-// identifier every time (never reused from a route's own pre-sanitized
-// folderKey variable, which can legally differ char-for-char — e.g. an
-// email identifier's "@" survives buildFolderKey's own filter but not this
-// outer sanitize()) so every audit entry's target lines up with the Admin
-// dashboard's own reconstruction of it from student.name/email/phone.
-function auditTargetFor(studentName, studentIdentifier) {
-  return sanitize(buildFolderKey((studentName || '').trim(), (studentIdentifier || '').trim()));
-}
 
 // Saves an uploaded (and already converted) document for either kind of
 // student. Railway students get an encrypted bucket copy; Drive students
@@ -170,7 +161,7 @@ async function saveReports(ref, summaryBuf, eligBuf, uploadedBy) {
 
 // POST /api/upload
 // Returns parsedData in response — frontend holds this, no JSON saved
-router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (req, res) => {
+router.post('/upload', verifyJWT, requireStaff, scopedUpload(upload.single('file')), async (req, res) => {
   try {
     const { studentName, subFolder, fileName } = req.body;
     const skipOcr = req.body.skipOcr === '1';
@@ -179,7 +170,7 @@ router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (re
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
 
-    const ref = await resolveOrCreateStudent(cleanFolderKey(studentName));
+    const ref = await staffStudent(req.admin, cleanFolderKey(studentName), { create: true });
     const out = await processUpload(ref, { subFolder, fileName, file, skipOcr, uploadedBy: req.admin.name });
     if (out.rejected) {
       logAudit({
@@ -190,6 +181,7 @@ router.post('/upload', verifyJWT, requireStaff, upload.single('file'), async (re
     }
     res.json({ success: true, ...out.result });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message });
     console.error('Upload error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
@@ -205,12 +197,14 @@ router.post('/meta', verifyJWT, requireStaff, async (req, res) => {
     try { metaObj = JSON.parse(metaJson); }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
-    const ref  = await resolveOrCreateStudent(cleanFolderKey(studentName));
-    const file = await writeMeta(ref, metaObj);
+    const ref  = await staffStudent(req.admin, cleanFolderKey(studentName), { create: true });
+    const existing = await readMeta(ref).catch(() => ({}));
+    const file = await writeMeta(ref, mergeStudentMeta(existing, metaObj, req.admin));
 
     studentsCache.clear();
     res.json({ success: true, ...(file && file.id && { fileId: file.id }) });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message });
     console.error('saveMeta error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
@@ -225,7 +219,7 @@ router.post('/summary', verifyJWT, requireStaff, async (req, res) => {
     if (!studentName || !htmlContent) return res.status(400).json({ success: false, error: 'Missing studentName or htmlContent' });
 
     const dispName = folderKeyDisplayName(studentName);
-    const ref      = await resolveOrCreateStudent(cleanFolderKey(studentName));
+    const ref      = await staffStudent(req.admin, cleanFolderKey(studentName), { create: true });
 
     let eligHtml = null;
     try { eligHtml = buildEligibilityHtml(dispName, documents); }
@@ -242,6 +236,7 @@ router.post('/summary', verifyJWT, requireStaff, async (req, res) => {
 
     res.json(await saveReports(ref, summaryBuf, eligBuf, req.admin.name));
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message });
     console.error('saveSummaryPdf error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
@@ -255,60 +250,50 @@ router.post('/eligibility-report', verifyJWT, requireStaff, async (req, res) => 
     if (!studentName) return res.status(400).json({ success: false, error: 'Missing studentName' });
 
     const dispName = folderKeyDisplayName(studentName);
-    const ref      = await resolveOrCreateStudent(cleanFolderKey(studentName));
+    const ref      = await staffStudent(req.admin, cleanFolderKey(studentName));
     const html     = buildEligibilityHtml(dispName, documents);
     const pdfBuf   = await convertHtmlToPdf(html, dispName + '_Elig');
 
     const uploaded = await saveGeneratedPdf(ref, 'Eligibility_Report.pdf', pdfBuf, req.admin.name);
     res.json({ success: true, fileId: uploaded.id, webViewLink: uploaded.webViewLink || null });
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message });
     console.error('eligibilityReport error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
-// ── Student self-service upload (no JWT — validated by name + identifier) ─────
-// Security: the student must ALREADY EXIST (created via /api/student-meta
-// during registration). resolveStudent never creates anything, which
-// prevents unauthenticated callers from creating arbitrary students.
-router.post('/student-upload', upload.single('file'), async (req, res) => {
-  try {
-    const { studentName, studentIdentifier, subFolder, fileName } = req.body;
-    const file = req.file;
+// ── Student self-service upload ─────────────────────────────────────────────
+// The application comes from the applicant's PIN session (requireApplicant),
+// never from the form: a student can only ever add to their own file.
+const displayNameOf = (ref) => sanitize(ref.key.split('__')[0] || ref.key);
 
-    if (!studentName || !studentName.trim()) {
-      return res.status(400).json({ success: false, error: 'Missing studentName' });
-    }
-    if (!studentIdentifier || studentIdentifier.trim().length < 5) {
-      return res.status(400).json({ success: false, error: 'Missing or invalid identifier' });
-    }
+router.post('/student-upload', requireApplicant, scopedUpload(upload.single('file')), async (req, res) => {
+  try {
+    const { subFolder, fileName } = req.body;
+    const file = req.file;
     if (!subFolder || !fileName || !file) {
       return res.status(400).json({ success: false, error: 'Missing required fields' });
     }
-
-    const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
     const skipOcr = req.body.skipOcr === '1';
-
-    const ref = await resolveStudent(folderKey);
-    if (!ref) {
-      return res.status(404).json({ success: false, error: 'Student not found. Please complete registration first.' });
-    }
+    const ref = req.studentRef;
+    const studentName = displayNameOf(ref);
 
     const out = await processUpload(ref, {
-      subFolder: subFolder.trim(), fileName, file, skipOcr, uploadedBy: sanitize(studentName.trim()),
+      subFolder: subFolder.trim(), fileName, file, skipOcr, uploadedBy: studentName,
     });
     if (out.rejected) {
       logAudit({
-        actor: sanitize(studentName.trim()), role: 'student', action: 'document.rejected',
-        target: auditTargetFor(studentName, studentIdentifier), details: { subFolder: sanitize(subFolder), fileName, docType: out.docType },
+        actor: studentName, role: 'student', action: 'document.rejected',
+        target: ref.key, details: { subFolder: sanitize(subFolder), fileName, docType: out.docType },
       });
       return res.status(422).json({ success: false, rejected: true, error: out.reason });
     }
     const result = out.result;
 
     logAudit({
-      actor: sanitize(studentName.trim()), role: 'student', action: 'document.upload',
-      target: auditTargetFor(studentName, studentIdentifier),
+      actor: studentName, role: 'student', action: 'document.upload',
+      target: ref.key,
       details: { subFolder: sanitize(subFolder), fileName: result.fileName, ...(result.reader && { check: result.reader.gate.status }) },
     });
 
@@ -319,11 +304,9 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
   }
 });
 
-// POST /api/student-summary — student self-service summary + eligibility PDF (no JWT)
-// Mirrors staff /api/summary but validated by name + identifier, same as
-// student-upload/student-meta. This is the ONLY caller in practice — the
-// student portal generates its own summary PDF on every save — so it must
-// not require a staff JWT the student never has.
+// POST /api/student-summary — the signed-in applicant's summary + eligibility
+// PDF. Mirrors staff /api/summary. This is the ONLY caller in practice — the
+// student portal generates its own summary PDF on every save.
 //
 // The summary PDF itself now arrives pre-rendered as a real file (multipart
 // field "summaryPdf") — summaryGenerator.js builds it client-side with
@@ -331,31 +314,18 @@ router.post('/student-upload', upload.single('file'), async (req, res) => {
 // properties), none of which survive the convertHtmlToPdf() pipeline below
 // (a Google Docs HTML import, not a browser engine). The eligibility report
 // alongside it is unaffected — it's simple enough to stay on that pipeline.
-// Body (multipart/form-data): studentName, studentIdentifier,
-// documents (JSON-encoded [...parsedData]), summaryPdf (file)
-router.post('/student-summary', upload.single('summaryPdf'), async (req, res) => {
+// Body (multipart/form-data): documents (JSON-encoded [...parsedData]),
+// summaryPdf (file)
+router.post('/student-summary', requireApplicant, scopedUpload(upload.single('summaryPdf')), async (req, res) => {
   try {
-    const { studentName, studentIdentifier } = req.body;
     let documents = [];
     try { documents = req.body.documents ? JSON.parse(req.body.documents) : []; }
     catch (_) { documents = []; }
-
-    if (!studentName || !studentName.trim()) {
-      return res.status(400).json({ success: false, error: 'Missing studentName' });
-    }
-    if (!studentIdentifier || studentIdentifier.trim().length < 5) {
-      return res.status(400).json({ success: false, error: 'Missing or invalid identifier' });
-    }
     if (!req.file) {
       return res.status(400).json({ success: false, error: 'Missing summaryPdf' });
     }
-
-    const dispName  = sanitize(studentName.trim());
-    const folderKey = buildFolderKey(dispName, studentIdentifier.trim());
-
-    // The student should already exist (meta save runs first), but create
-    // defensively so a summary save never fails on that alone.
-    const ref = await resolveOrCreateStudent(folderKey);
+    const ref = req.studentRef;
+    const dispName = displayNameOf(ref);
 
     let eligHtml = null;
     try { eligHtml = buildEligibilityHtml(dispName, documents); }
@@ -370,7 +340,7 @@ router.post('/student-summary', upload.single('summaryPdf'), async (req, res) =>
 
     logAudit({
       actor: dispName, role: 'student', action: 'summary.generate',
-      target: auditTargetFor(studentName, studentIdentifier), details: null,
+      target: ref.key, details: null,
     });
 
     res.json(response);
@@ -380,36 +350,27 @@ router.post('/student-summary', upload.single('summaryPdf'), async (req, res) =>
   }
 });
 
-// POST /api/student-meta — student self-service meta save (no JWT)
-// Creates the student on first save: on Railway for brand-new students,
-// in Drive only if Railway storage isn't configured. A student who already
-// has a Drive folder keeps being saved there.
-router.post('/student-meta', async (req, res) => {
+// POST /api/student-meta — the signed-in applicant saves their record.
+// (Registration creates it: POST /api/applicant/register.)
+router.post('/student-meta', requireApplicant, async (req, res) => {
   try {
-    const { studentName, studentIdentifier, metaJson } = req.body;
-
-    if (!studentName || !studentName.trim()) {
-      return res.status(400).json({ success: false, error: 'Missing studentName' });
-    }
-    if (!studentIdentifier || studentIdentifier.trim().length < 5) {
-      return res.status(400).json({ success: false, error: 'Missing or invalid identifier' });
-    }
+    const { metaJson } = req.body;
     if (!metaJson) {
       return res.status(400).json({ success: false, error: 'Missing metaJson' });
     }
-
     let metaObj;
     try { metaObj = JSON.parse(metaJson); }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
+    const ref = req.studentRef;
 
-    const folderKey = buildFolderKey(sanitize(studentName.trim()), studentIdentifier.trim());
-    const ref = await resolveOrCreateStudent(folderKey);
-    await writeMeta(ref, metaObj);
+    // Staff-owned fields (loan status, lender sharing…) keep their stored values.
+    const existing = await readMeta(ref).catch(() => ({}));
+    await writeMeta(ref, mergeStudentMeta(existing, metaObj, 'student'));
 
     studentsCache.clear();
     logAudit({
-      actor: sanitize(studentName.trim()), role: 'student', action: 'student.save',
-      target: auditTargetFor(studentName, studentIdentifier), details: { storage: ref.kind },
+      actor: displayNameOf(ref), role: 'student', action: 'student.save',
+      target: ref.key, details: { storage: ref.kind },
     });
     res.json({ success: true });
   } catch (err) {

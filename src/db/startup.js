@@ -16,13 +16,29 @@ function isRailwayStorageReady() {
 
 // scheduled: only the running server schedules nightly backups — scripts
 // and tests that also call this must not.
-async function initRailwayStorage({ schedule = false } = {}) {
+async function runDriveImports() {
+  // Accounts live in Postgres; the first boot copies the old Drive roster in.
+  const accounts = require('../services/accounts');
+  await accounts.importLegacyAccounts()
+    .then(() => accounts.backfillEmailsFromNames())
+    .catch((err) => console.error('[accounts] import from admins.json failed:', err.message));
+  // The small Drive JSON files (audit log, lender access requests) are copied
+  // in once; student folders move with scripts/migrate-drive-to-railway.js.
+  const driveImport = require('../services/driveImport');
+  await driveImport.importLegacyAuditLog()
+    .then(() => driveImport.importLegacyRequests())
+    .catch((err) => console.error('[import] copying Drive JSON files failed:', err.message));
+}
+
+// imports: false skips the one-time Drive copies (the migration script's dry run).
+async function initRailwayStorage({ schedule = false, imports = true } = {}) {
   const parts = { database: isDbEnabled(), bucket: isBucketEnabled(), encryption: isEncryptionConfigured() };
   if (!parts.database) {
     console.log('[storage] Railway storage off (no DATABASE_URL) — using Google Drive');
     return false;
   }
   await runMigrations();
+  if (imports) await runDriveImports();
   ready = parts.bucket && parts.encryption;
   console.log(ready
     ? '[storage] Railway storage ready (Postgres + encrypted bucket)'

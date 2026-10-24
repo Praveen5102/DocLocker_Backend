@@ -1,13 +1,14 @@
 const express = require('express');
 const { readAuditLog } = require('../services/auditLog');
-const { verifyJWT, requireSuperAdmin } = require('../middleware/auth');
+const { verifyJWT, requireCompanyAdmin } = require('../middleware/auth');
 
 const router = express.Router();
 
-// GET /api/audit — superadmin only. Newest first, optionally filtered by
+// GET /api/audit — superadmin (every company, or one via the company
+// header) and company admins (their own company only). Newest first, optionally filtered by
 // action / actor, capped to a page size so the client never has to render
 // (or wait on) the full multi-thousand-entry history at once.
-router.get('/', verifyJWT, requireSuperAdmin, async (req, res) => {
+router.get('/', verifyJWT, requireCompanyAdmin, async (req, res) => {
   try {
     const { action, actor, limit } = req.query;
     let entries = await readAuditLog();

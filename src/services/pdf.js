@@ -68,9 +68,14 @@ async function convertDocToPdf(buffer, mimeType, baseName) {
 // Build a clean single-page PDF from an image buffer using pdf-lib (embeds image as-is, no re-encoding)
 async function buildImagePdf(buffer, mimeType) {
   const pdfDoc = await PDFDocument.create();
+  // pdf-lib reads from the start of the underlying memory and ignores a
+  // Buffer's offset. An upload that arrives in one network chunk is a slice
+  // of a larger block, so it would read the wrong bytes ("SOI not found in
+  // JPEG"). Its own copy always starts at 0.
+  const bytes = new Uint8Array(buffer);
   const image = mimeType === 'image/png'
-    ? await pdfDoc.embedPng(buffer)
-    : await pdfDoc.embedJpg(buffer);
+    ? await pdfDoc.embedPng(bytes)
+    : await pdfDoc.embedJpg(bytes);
 
   const { width, height } = image.size();
   const page = pdfDoc.addPage([width, height]);

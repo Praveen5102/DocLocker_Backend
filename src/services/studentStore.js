@@ -11,8 +11,9 @@
 // no Drive folder exists for them, so a returning (old) student is never
 // split across the two.
 //
-// Every query is scoped to the owner organisation (Flyurdream) — partner
-// tenants will get their own org_id once they're onboarded.
+// Every query is scoped to the companies the current request may see (see
+// services/tenantScope.js). Legacy Drive students all belong to Flyurdream,
+// so they are only visible when that scope includes the owner organisation.
 
 const crypto = require('crypto');
 const { query, withTransaction } = require('../db');
@@ -23,8 +24,8 @@ const {
   ROOT_FOLDER_ID, sanitize, findFolderByName, getOrCreate,
 } = require('./drive');
 const { readStudentMeta, writeStudentMeta } = require('./studentMeta');
+const { ownerOrgId, scopeOrgIds, homeOrgId, includesOwner } = require('./tenantScope');
 
-const OWNER_ORG_SLUG = 'flyurdream';
 const GENERATED_FILES = ['Student_Summary.pdf', 'Eligibility_Report.pdf'];
 
 // Public ids for Railway documents. Drive file ids never start with "rw_",
@@ -41,18 +42,8 @@ const isRailwayFileId = (id) => parsePublicId(id) !== null;
 // getOrCreate/findFolderByName always pass through sanitize().
 const studentKeyOf = (raw) => sanitize(raw);
 
-let orgIdPromise = null;
-function ownerOrgId() {
-  if (!orgIdPromise) {
-    orgIdPromise = query('SELECT id FROM organizations WHERE slug = $1', [OWNER_ORG_SLUG])
-      .then(({ rows }) => {
-        if (!rows[0]) throw new Error(`Organisation "${OWNER_ORG_SLUG}" is missing — run migrations`);
-        return rows[0].id;
-      })
-      .catch((err) => { orgIdPromise = null; throw err; });
-  }
-  return orgIdPromise;
-}
+// `org_id = ANY($n)` unless the scope is every company (superadmin).
+const ORG_FILTER = (n, col = 'org_id') => `($${n}::uuid[] IS NULL OR ${col} = ANY($${n}::uuid[]))`;
 
 // Searchable columns kept beside the encrypted record. Everything else
 // (addresses, ID numbers, family details, uploads…) only exists inside
@@ -75,21 +66,23 @@ function indexColumns(key, meta) {
 
 async function findRailwayRow(key) {
   if (!isRailwayStorageReady()) return null;
-  const orgId = await ownerOrgId();
   const { rows } = await query(
-    "SELECT id, org_id, folder_key FROM students WHERE org_id = $1 AND folder_key = $2 AND source = 'railway'",
-    [orgId, key],
+    `SELECT id, org_id, folder_key FROM students
+      WHERE ${ORG_FILTER(1)} AND folder_key = $2 AND source = 'railway'
+      ORDER BY created_at LIMIT 1`,
+    [await scopeOrgIds(), key],
   );
   return rows[0] || null;
 }
 
-// → { kind: 'railway', key, studentId, orgId } | { kind: 'drive', key, dir } | null
+// → { kind: 'railway', key, studentId, orgId } | { kind: 'drive', key, orgId, dir } | null
 async function resolveStudent(rawKey) {
   const key = studentKeyOf(rawKey);
   const row = await findRailwayRow(key);
   if (row) return { kind: 'railway', key, studentId: row.id, orgId: row.org_id };
+  if (!(await includesOwner())) return null;
   const dir = await findFolderByName(ROOT_FOLDER_ID(), key);
-  return dir ? { kind: 'drive', key, dir } : null;
+  return dir ? { kind: 'drive', key, orgId: await ownerOrgId(), dir } : null;
 }
 
 // Same as resolveStudent, but a student found nowhere is created — on
@@ -98,10 +91,13 @@ async function resolveOrCreateStudent(rawKey) {
   const found = await resolveStudent(rawKey);
   if (found) return found;
   const key = studentKeyOf(rawKey);
+  const orgId = await homeOrgId();
+  const isOwner = orgId === (await ownerOrgId());
   if (!isRailwayStorageReady()) {
-    return { kind: 'drive', key, dir: await getOrCreate(ROOT_FOLDER_ID(), key) };
+    // Partner companies only ever live on Railway.
+    if (!isOwner) throw Object.assign(new Error('Storage is not available right now'), { status: 503 });
+    return { kind: 'drive', key, orgId, dir: await getOrCreate(ROOT_FOLDER_ID(), key) };
   }
-  const orgId = await ownerOrgId();
   const cols = indexColumns(key, {});
   // ON CONFLICT: a double-submitted registration resolves to the one row.
   const { rows } = await query(
@@ -113,7 +109,7 @@ async function resolveOrCreateStudent(rawKey) {
   );
   if (rows[0].source !== 'railway') {
     // An imported Drive student already owns this key — keep using Drive.
-    return { kind: 'drive', key, dir: await getOrCreate(ROOT_FOLDER_ID(), key) };
+    return { kind: 'drive', key, orgId, dir: await getOrCreate(ROOT_FOLDER_ID(), key) };
   }
   return { kind: 'railway', key, studentId: rows[0].id, orgId };
 }
@@ -169,18 +165,21 @@ async function updateMeta(ref, mutate) {
 
 async function listRailwayStudents() {
   if (!isRailwayStorageReady()) return [];
-  const orgId = await ownerOrgId();
+  const orgIds = await scopeOrgIds();
   const [{ rows: students }, { rows: generated }] = await Promise.all([
     query(
-      "SELECT id, folder_key, record_enc, updated_at FROM students WHERE org_id = $1 AND source = 'railway' ORDER BY updated_at DESC",
-      [orgId],
+      `SELECT s.id, s.org_id, s.folder_key, s.record_enc, s.updated_at, o.name AS org_name, o.slug AS org_slug
+         FROM students s JOIN organizations o ON o.id = s.org_id
+        WHERE ${ORG_FILTER(1, 's.org_id')} AND s.source = 'railway'
+        ORDER BY s.updated_at DESC`,
+      [orgIds],
     ),
     query(
       `SELECT DISTINCT ON (student_id, file_name) student_id, id, file_name, created_at
          FROM documents
-        WHERE org_id = $1 AND section = 'Others' AND file_name = ANY($2) AND deleted_at IS NULL
+        WHERE ${ORG_FILTER(1)} AND section = 'Others' AND file_name = ANY($2) AND deleted_at IS NULL
         ORDER BY student_id, file_name, created_at DESC`,
-      [orgId, GENERATED_FILES],
+      [orgIds, GENERATED_FILES],
     ),
   ]);
 
@@ -194,7 +193,8 @@ async function listRailwayStudents() {
   }
 
   return students.map((s) => {
-    const base = { name: s.folder_key, storage: 'railway', studentKey: s.folder_key };
+    const company = { id: s.org_id, name: s.org_name, slug: s.org_slug };
+    const base = { name: s.folder_key, storage: 'railway', studentKey: s.folder_key, company };
     const { summaryPdf = null, eligibilityPdf = null } = gen.get(s.id) || {};
     let meta;
     try {
@@ -202,28 +202,29 @@ async function listRailwayStudents() {
     } catch (err) {
       return { ...base, _parseError: 'Record could not be decrypted', updatedAt: s.updated_at.toISOString(), summaryPdf, eligibilityPdf };
     }
-    return { ...base, ...meta, storage: 'railway', studentKey: s.folder_key, updatedAt: s.updated_at.toISOString(), summaryPdf, eligibilityPdf };
+    return { ...base, ...meta, storage: 'railway', studentKey: s.folder_key, company, updatedAt: s.updated_at.toISOString(), summaryPdf, eligibilityPdf };
   });
 }
 
 // Student self-service lookup by email/phone (the identifier half of the key).
-async function findRailwayStudentByIdentifier(identifier) {
+// withOrg: also say which company the student belongs to ({ student, orgId }).
+async function findRailwayStudentByIdentifier(identifier, { withOrg = false } = {}) {
   if (!isRailwayStorageReady()) return null;
-  const orgId = await ownerOrgId();
   const sanitizedId = identifier.replace(/[^a-zA-Z0-9 _\-.]/g, '_');
   const { rows } = await query(
-    `SELECT id, folder_key, record_enc FROM students
-      WHERE org_id = $1 AND source = 'railway'
+    `SELECT id, org_id, folder_key, record_enc FROM students
+      WHERE ${ORG_FILTER(1)} AND source = 'railway'
         AND (lower(identifier) = lower($2) OR lower(identifier) = lower($3)
              OR lower(email) = lower($2) OR phone = $2)
       ORDER BY updated_at DESC LIMIT 1`,
-    [orgId, identifier, sanitizedId],
+    [await scopeOrgIds(), identifier, sanitizedId],
   );
   if (!rows[0]) return null;
   const meta = decryptJson(rows[0].record_enc);
   const sep = rows[0].folder_key.indexOf('__');
   const displayName = sep >= 0 ? rows[0].folder_key.slice(0, sep) : rows[0].folder_key;
-  return { ...meta, name: meta.name || displayName, storage: 'railway', studentKey: rows[0].folder_key };
+  const student = { ...meta, name: meta.name || displayName, storage: 'railway', studentKey: rows[0].folder_key };
+  return withOrg ? { student, orgId: rows[0].org_id } : student;
 }
 
 // ── Documents (Railway students only) ────────────────────────────────────────
@@ -296,18 +297,17 @@ async function findLatestDocument(ref, section, fileName) {
 async function getDocument(publicId) {
   const id = parsePublicId(publicId);
   if (!id || !isRailwayStorageReady()) return null;
-  const orgId = await ownerOrgId();
   const { rows } = await query(
-    `SELECT d.id, d.file_name, d.mime_type, d.storage_key, d.sha256, s.id AS student_id, s.folder_key
+    `SELECT d.id, d.org_id, d.file_name, d.mime_type, d.storage_key, d.sha256, s.id AS student_id, s.folder_key
        FROM documents d JOIN students s ON s.id = d.student_id
-      WHERE d.id = $1 AND d.org_id = $2 AND d.deleted_at IS NULL AND d.storage = 'bucket'`,
-    [id, orgId],
+      WHERE d.id = $1 AND ${ORG_FILTER(2, 'd.org_id')} AND d.deleted_at IS NULL AND d.storage = 'bucket'`,
+    [id, await scopeOrgIds()],
   );
   if (!rows[0]) return null;
   const r = rows[0];
   return {
     doc: { id: toPublicId(r.id), name: r.file_name, mimeType: r.mime_type, storageKey: r.storage_key, sha256: r.sha256 },
-    ref: { kind: 'railway', key: r.folder_key, studentId: r.student_id, orgId },
+    ref: { kind: 'railway', key: r.folder_key, studentId: r.student_id, orgId: r.org_id },
   };
 }
 
