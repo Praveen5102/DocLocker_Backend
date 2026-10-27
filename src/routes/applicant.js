@@ -294,7 +294,7 @@ router.get('/documents-zip', requireApplicant, async (req, res) => {
 const ACTIVITY_ACTIONS = [
   'student.register', 'applicant.submit', 'document.upload', 'loan_status.update',
   'banker_access.grant', 'banker_access.approve', 'banker_access.revoke',
-  'document.view', 'document.download', 'document.download_all',
+  'document.view', 'document.download', 'document.download_all', 'sanction_letter.upload',
 ];
 router.get('/activity', requireApplicant, async (req, res) => {
   try {

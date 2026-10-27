@@ -4,6 +4,8 @@
 
 const LOAN_FIELDS = [
   'loanStatus', 'loanRemark', 'loanStatusUpdatedBy', 'loanStatusUpdatedAt', 'loanDisbursement',
+  // Set by POST /api/students/:key/sanction-letter only
+  'sanctionLetter',
 ];
 const SHARING_FIELDS = ['sharedBankers'];
 
@@ -20,7 +22,8 @@ function mergeStudentMeta(existing = {}, incoming = {}, who = 'student') {
   const role = who === 'student' ? 'student' : who.role;
   const isAdmin = role === 'superadmin' || role === 'admin';
 
-  // Loan status has its own endpoint (with remarks and audit), for everyone.
+  // Loan status and the sanction letter have their own endpoints (with
+  // remarks and audit), for everyone.
   keep(next, existing, LOAN_FIELDS);
   // Sharing with lenders goes through banker-access (advisors need approval).
   keep(next, existing, SHARING_FIELDS);

@@ -1,12 +1,14 @@
 const express = require('express');
 const archiver = require('archiver');
+const multer = require('multer');
 const {
   sanitize, buildFolderKey,
 } = require('../services/drive');
 const {
   resolveStudent, readMeta, updateMeta,
 } = require('../services/studentStore');
-const { verifyJWT, verifyJWTOrTicket, requireStaff, requireCompanyAdmin } = require('../middleware/auth');
+const { verifyJWT, verifyJWTOrTicket, requireStaff, requireCompanyAdmin, scopedUpload } = require('../middleware/auth');
+const { saveSanctionLetter, letterType } = require('../services/sanctionLetter');
 const { canSeeStudent, staffStudent } = require('../services/access');
 const { visibleFiles, fileBytes } = require('../services/studentFiles');
 const { findByName } = require('../services/accounts');
@@ -302,6 +304,58 @@ router.put('/:studentKey/loan-status', verifyJWT, async (req, res) => {
     res.json({ success: true, loanStatus: meta.loanStatus, loanRemark: meta.loanRemark, loanDisbursement: meta.loanDisbursement || null });
   } catch (err) {
     console.error('loanStatus update error:', err.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// POST /api/students/:studentKey/sanction-letter — the lender's sanction
+// letter (PDF, JPG or PNG; form field "file"). Staff who can see the student,
+// or a lender the student is shared with. Replaces any earlier letter and
+// records it on the student, so staff see it's in and the student can
+// download it.
+const letterUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
+router.post('/:studentKey/sanction-letter', verifyJWT, scopedUpload(letterUpload.single('file')), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, error: 'Choose the sanction letter to upload' });
+    if (!letterType(req.file)) {
+      return res.status(400).json({ success: false, error: 'The sanction letter must be a PDF, JPG or PNG file.' });
+    }
+
+    const folderKey = sanitize(req.params.studentKey);
+    const ref = await resolveStudent(folderKey);
+    if (!ref) return res.status(404).json({ success: false, error: `Student "${folderKey}" not found` });
+    if (!(await canSeeStudent(req.admin, ref))) {
+      return res.status(403).json({ success: false, error: 'You do not have access to this student' });
+    }
+    // A lender only for students shared with them — checked before the file
+    // is stored, and again when the record is written.
+    if (req.admin.role === 'banker' && !bankerHasAccess(await readMeta(ref), req.admin.name)) {
+      return res.status(403).json({ success: false, error: 'You do not have access to this student' });
+    }
+
+    const saved = await saveSanctionLetter(ref, req.file, req.admin.name);
+    const sanctionLetter = {
+      fileId: saved.fileId, name: saved.name, uploadedBy: req.admin.name, uploadedAt: new Date().toISOString(),
+    };
+    const ACCESS_DENIED = Symbol('access denied');
+    const meta = await updateMeta(ref, (m) => {
+      if (req.admin.role === 'banker' && !bankerHasAccess(m, req.admin.name)) throw ACCESS_DENIED;
+      m.sanctionLetter = sanctionLetter;
+    }).catch((err) => {
+      if (err === ACCESS_DENIED) return null;
+      throw err;
+    });
+    if (!meta) return res.status(403).json({ success: false, error: 'You do not have access to this student' });
+    studentsCache.clear();
+
+    logAudit({
+      actor: req.admin.name, role: req.admin.role, action: 'sanction_letter.upload', target: folderKey,
+      details: { fileName: saved.name, loanStatus: meta.loanStatus || 'pending' },
+    });
+    res.json({ success: true, sanctionLetter });
+  } catch (err) {
+    if (err.status) return res.status(err.status).json({ success: false, error: err.message });
+    console.error('sanctionLetter upload error:', err.message);
     res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
