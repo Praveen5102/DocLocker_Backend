@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // Records sanction letters uploaded before letters were tracked on the
 // student. For every sanctioned or disbursed student without
-// meta.sanctionLetter, looks for Loan_Documents/Sanction_Letter.* in their
-// file and, when found, writes meta.sanctionLetter. Nothing is uploaded,
+// meta.sanctionLetter, looks for a sanction letter in their file (any
+// document named like one, Loan_Documents/Sanction_Letter.* first) and,
+// when found, writes meta.sanctionLetter. The app already shows found
+// letters without this; recording them just saves the lookups. Nothing is uploaded,
 // moved or deleted; a student with no letter is only reported.
 //
 // Usage (from the Backend folder, with the environment you want to update):
@@ -47,7 +49,8 @@ async function main() {
       console.log(`  ${APPLY ? 'recording' : 'would record'} ${letter.name} for ${key}`);
       if (APPLY) {
         await updateMeta(ref, (m) => {
-          if (!m.sanctionLetter) m.sanctionLetter = { ...letter, uploadedBy: 'backfill' };
+          const { fileId, name, uploadedAt } = letter;
+          if (!m.sanctionLetter) m.sanctionLetter = { fileId, name, uploadedAt, uploadedBy: 'backfill' };
         });
       }
     }

@@ -9,6 +9,7 @@ const {
 const { includesOwner, ownerOrgId } = require('../services/tenantScope');
 const { parseIdentifier, locateStudent, findMetaFile, warmDriveContacts } = require('../services/studentLocator');
 const { canSeeMeta } = require('../services/access');
+const { findSanctionLetter, LETTER_STAGES } = require('../services/sanctionLetter');
 
 const router = express.Router();
 warmDriveContacts();
@@ -51,7 +52,11 @@ router.get('/', verifyJWT, async (req, res) => {
             const updatedAt = metaFiles[0].modifiedTime || null;
             try {
               const meta = await readJsonFile(metaFiles[0].id);
-              return { ...obj, ...meta, updatedAt, summaryPdf, eligibilityPdf };
+              // A letter saved before letters were recorded: found in the folder
+              const sanctionLetter = meta.sanctionLetter || (LETTER_STAGES.has(meta.loanStatus)
+                ? await findSanctionLetter({ kind: 'drive', dir: { id: folder.id } }).catch(() => null)
+                : null) || undefined;
+              return { ...obj, ...meta, sanctionLetter, updatedAt, summaryPdf, eligibilityPdf };
             } catch (err) {
               return { ...obj, _parseError: err.message, updatedAt, summaryPdf, eligibilityPdf };
             }

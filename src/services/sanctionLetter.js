@@ -39,16 +39,36 @@ async function saveSanctionLetter(ref, file, uploadedBy) {
   return { fileId: uploaded.id, name: uploaded.name };
 }
 
-// A letter already in the file but not yet recorded on the student (saved
-// before letters were recorded) → { fileId, name, uploadedAt } | null
+// Any document whose name says it's a sanction letter ("Sanction_Letter.pdf",
+// "HDFC sanction letter.pdf"…). Ranked: our own Loan_Documents/Sanction_Letter.*
+// first, then anything in Loan_Documents, then the newest elsewhere.
+const isLetterName = (name) => /sanction/i.test(String(name || ''));
+function letterRank(f) {
+  const inSection = String(f.group || '').split('/').pop() === SECTION;
+  return (inSection ? 2 : 0) + (/^sanction_letter\./i.test(f.name || '') ? 1 : 0);
+}
+
+// A letter already in the file but not recorded on the student (saved
+// before letters were recorded, or put in the folder by hand)
+// → { fileId, name, section, uploadedAt, found: true } | null
 async function findSanctionLetter(ref) {
   const letters = (await visibleFiles(ref))
-    .filter((f) => String(f.group || '').split('/').pop() === SECTION && /^sanction_letter\./i.test(f.name || ''))
-    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+    .filter((f) => isLetterName(f.name))
+    .sort((a, b) => letterRank(b) - letterRank(a) || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
   const f = letters[0];
   if (!f) return null;
   const at = f.updatedAt ? new Date(f.updatedAt).toISOString() : null;
-  return { fileId: f.id, name: f.name, uploadedAt: at };
+  return { fileId: f.id, name: f.name, section: String(f.group || '').split('/').pop() || null, uploadedAt: at, found: true };
 }
 
-module.exports = { saveSanctionLetter, findSanctionLetter, letterType };
+const LETTER_STAGES = new Set(['sanctioned', 'disbursed']);
+
+// The student's letter: the recorded one, or one found in their file when
+// the loan is sanctioned or disbursed. Never writes anything.
+async function sanctionLetterOf(ref, meta = {}) {
+  if (meta.sanctionLetter) return meta.sanctionLetter;
+  if (!LETTER_STAGES.has(meta.loanStatus)) return null;
+  return findSanctionLetter(ref).catch(() => null);
+}
+
+module.exports = { saveSanctionLetter, findSanctionLetter, sanctionLetterOf, letterType, LETTER_STAGES };

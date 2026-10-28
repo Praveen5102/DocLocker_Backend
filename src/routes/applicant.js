@@ -19,6 +19,7 @@ const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
 const { query } = require('../db');
 
+const { sanctionLetterOf } = require('../services/sanctionLetter');
 const router = express.Router();
 
 const fail = (res, status, error, extra = {}) => res.status(status).json({ success: false, error, ...extra });
@@ -180,9 +181,10 @@ router.post('/create-pin', studentCompany, async (req, res) => {
 router.get('/me', requireApplicant, async (req, res) => {
   try {
     const meta = await readMeta(req.studentRef);
+    const sanctionLetter = await sanctionLetterOf(req.studentRef, meta);
     res.json({
       success: true,
-      student: applicantRecord(req.studentRef, meta),
+      student: { ...applicantRecord(req.studentRef, meta), sanctionLetter: sanctionLetter || undefined },
       company: await companyOf(req.studentRef.orgId),
       lenders: await lendersOf(meta),
     });

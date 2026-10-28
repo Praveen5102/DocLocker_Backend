@@ -166,7 +166,7 @@ async function updateMeta(ref, mutate) {
 async function listRailwayStudents() {
   if (!isRailwayStorageReady()) return [];
   const orgIds = await scopeOrgIds();
-  const [{ rows: students }, { rows: generated }] = await Promise.all([
+  const [{ rows: students }, { rows: generated }, { rows: letters }] = await Promise.all([
     query(
       `SELECT s.id, s.org_id, s.folder_key, s.record_enc, s.updated_at, o.name AS org_name, o.slug AS org_slug
          FROM students s JOIN organizations o ON o.id = s.org_id
@@ -181,7 +181,20 @@ async function listRailwayStudents() {
         ORDER BY student_id, file_name, created_at DESC`,
       [orgIds, GENERATED_FILES],
     ),
+    // A sanction letter already in each file (matches services/sanctionLetter.js:
+    // Loan_Documents/Sanction_Letter.* first, then Loan_Documents, then newest)
+    query(
+      `SELECT DISTINCT ON (student_id) student_id, id, section, file_name, created_at
+         FROM documents
+        WHERE ${ORG_FILTER(1)} AND deleted_at IS NULL AND file_name ILIKE '%sanction%'
+        ORDER BY student_id, (section = 'Loan_Documents') DESC,
+                 (lower(file_name) LIKE 'sanction_letter.%') DESC, created_at DESC`,
+      [orgIds],
+    ),
   ]);
+  const found = new Map(letters.map((d) => [d.student_id, {
+    fileId: toPublicId(d.id), name: d.file_name, section: d.section, uploadedAt: d.created_at.toISOString(), found: true,
+  }]));
 
   const gen = new Map();
   for (const d of generated) {
@@ -202,7 +215,8 @@ async function listRailwayStudents() {
     } catch (err) {
       return { ...base, _parseError: 'Record could not be decrypted', updatedAt: s.updated_at.toISOString(), summaryPdf, eligibilityPdf };
     }
-    return { ...base, ...meta, storage: 'railway', studentKey: s.folder_key, company, updatedAt: s.updated_at.toISOString(), summaryPdf, eligibilityPdf };
+    const sanctionLetter = meta.sanctionLetter || found.get(s.id) || undefined;
+    return { ...base, ...meta, sanctionLetter, storage: 'railway', studentKey: s.folder_key, company, updatedAt: s.updated_at.toISOString(), summaryPdf, eligibilityPdf };
   });
 }
 
