@@ -38,6 +38,8 @@ const auditRoutes       = require('./routes/audit');
 const documentReaderRoutes = require('./routes/documentReader');
 const { initRailwayStorage } = require('./db/startup');
 const studentExtractRoutes = require('./routes/studentExtract');
+const consultanciesRoutes = require('./routes/consultancies');
+const documentEmailRoutes = require('./routes/documentEmail');
 
 const app  = express();
 const isProd = process.env.NODE_ENV === 'production';
@@ -146,6 +148,15 @@ const applicantAuthLimiter = rateLimit({
   message: { success: false, error: 'Too many tries in a short time. Please wait a few minutes and try again.' },
 });
 
+// Emailing documents: enough for a busy day, not for a script
+const emailLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, error: 'Too many emails sent in a short time, please wait a few minutes and try again.' },
+});
+
 app.use('/api/auth',              authLimiter);
 app.use(['/api/applicant/register', '/api/applicant/lookup', '/api/applicant/sign-in', '/api/applicant/create-pin'], applicantAuthLimiter);
 app.use('/api/upload',            uploadLimiter);
@@ -154,6 +165,7 @@ app.use('/api/student-meta',      apiLimiter);
 app.use('/api/students/find',     findLimiter);
 app.use('/api/document-reader',   documentReaderLimiter);
 app.use('/api/student-extract',   studentExtractLimiter);
+app.use(/^\/api\/students\/[^/]+\/email-documents$/, emailLimiter);
 app.use('/api',                   apiLimiter);
 
 // ── Health check ──────────────────────────────────────────────────────────────
@@ -172,6 +184,8 @@ app.use('/api/files',    fileProxyRoutes);
 app.use('/api/audit',    auditRoutes);
 app.use('/api/document-reader', documentReaderRoutes);
 app.use('/api/student-extract', studentExtractRoutes);
+app.use('/api/consultancies', consultanciesRoutes);
+app.use('/api',          documentEmailRoutes);
 app.use('/api',          filesRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────

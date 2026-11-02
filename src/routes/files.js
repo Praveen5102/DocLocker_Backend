@@ -18,9 +18,23 @@ const { verifyJWT, requireStaff, requireApplicant, scopedUpload } = require('../
 const { staffStudent } = require('../services/access');
 const { mergeStudentMeta } = require('../services/protectedMeta');
 const { logAudit }                       = require('../services/auditLog');
+const { findExact }                      = require('../services/consultancies');
+const { isRailwayStorageReady }          = require('../db/startup');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+
+// Staff (advisors) pick consultancies from their company's list; a name
+// that isn't listed goes to an admin as a request (routes/consultancies.js),
+// so a record save keeps the stored one.
+async function keepUnlistedConsultancy(admin, ref, existing, next) {
+  if (admin.role === 'superadmin' || admin.role === 'admin' || !isRailwayStorageReady()) return;
+  const before = (existing.personalInfo?.consultantNameLoc || '').trim();
+  const after = (next.personalInfo?.consultantNameLoc || '').trim();
+  if (!after || after === before) return;
+  if (await findExact(ref.orgId, after).catch(() => null)) return;
+  next.personalInfo = { ...(next.personalInfo || {}), consultantNameLoc: before };
+}
 
 // Saves an uploaded (and already converted) document for either kind of
 // student. Railway students get an encrypted bucket copy; Drive students
@@ -199,7 +213,9 @@ router.post('/meta', verifyJWT, requireStaff, async (req, res) => {
 
     const ref  = await staffStudent(req.admin, cleanFolderKey(studentName), { create: true });
     const existing = await readMeta(ref).catch(() => ({}));
-    const file = await writeMeta(ref, mergeStudentMeta(existing, metaObj, req.admin));
+    const next = mergeStudentMeta(existing, metaObj, req.admin);
+    await keepUnlistedConsultancy(req.admin, ref, existing, next);
+    const file = await writeMeta(ref, next);
 
     studentsCache.clear();
     res.json({ success: true, ...(file && file.id && { fileId: file.id }) });
