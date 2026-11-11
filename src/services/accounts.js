@@ -34,7 +34,7 @@ function passwordProblem(password) {
 }
 
 const ACCOUNT_COLUMNS = `a.id, a.org_id, a.name, a.email, a.role, a.bank, a.status, a.token_version,
-  a.failed_logins, a.locked_until, a.last_login_at, a.created_at, a.created_by,
+  a.failed_logins, a.locked_until, a.last_login_at, a.created_at, a.created_by, a.acts_as_advisor,
   o.name AS org_name, o.slug AS org_slug, o.kind AS org_kind, o.status AS org_status,
   o.logo_updated_at AS org_logo_at`;
 
@@ -46,6 +46,7 @@ function toAccount(r) {
     id: r.id, orgId: r.org_id, name: r.name, email: r.email, role: r.role, bank: r.bank || '',
     status: r.status, tokenVersion: r.token_version, failedLogins: r.failed_logins,
     lockedUntil: r.locked_until, lastLoginAt: r.last_login_at, createdAt: r.created_at, createdBy: r.created_by,
+    actsAsAdvisor: Boolean(r.acts_as_advisor),
     company: { id: r.org_id, name: r.org_name, slug: r.org_slug, kind: r.org_kind, status: r.org_status, logoUrl: logoUrl(r.org_slug, r.org_logo_at) },
   };
 }
@@ -55,6 +56,7 @@ function publicAccount(a) {
   return {
     id: a.id, name: a.name, email: a.email || '', role: a.role, roleLabel: ROLE_LABELS[a.role],
     bank: a.bank || '', status: a.status, lastLoginAt: a.lastLoginAt, createdAt: a.createdAt,
+    actsAsAdvisor: Boolean(a.actsAsAdvisor),
     company: { id: a.company.id, name: a.company.name, slug: a.company.slug, kind: a.company.kind, logoUrl: a.company.logoUrl || null },
   };
 }
@@ -146,6 +148,13 @@ async function listAccounts({ orgIds, roles } = {}) {
     [orgIds || null, roles || null],
   );
   return rows.map(toAccount);
+}
+
+// A superadmin choosing to also work as an advisor (migration 009).
+async function setActsAsAdvisor(id, enabled) {
+  await query('UPDATE accounts SET acts_as_advisor = $2, updated_at = now() WHERE id = $1', [id, Boolean(enabled)]);
+  forgetAuth(id);
+  return findById(id);
 }
 
 class AccountError extends Error {
@@ -284,7 +293,7 @@ module.exports = {
   getAuthAccount, forgetAuth,
   lockedMinutesLeft, recordFailedLogin, recordLogin,
   manageableRoles, canManage,
-  listAccounts, createAccount, updateAccount, deleteAccount, isLastSuperadmin,
+  listAccounts, createAccount, updateAccount, deleteAccount, isLastSuperadmin, setActsAsAdvisor,
   publicAccount, verifyPassword, hashPassword,
   importLegacyAccounts, backfillEmailsFromNames,
 };
