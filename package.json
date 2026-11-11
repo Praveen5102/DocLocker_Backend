@@ -12,7 +12,8 @@
     "test:students": "node scripts/smoke-railway-students.js",
     "migrate:drive": "node scripts/migrate-drive-to-railway.js",
     "backup": "node scripts/backup.js",
-    "backup:verify": "node scripts/backup.js verify"
+    "backup:verify": "node scripts/backup.js verify",
+    "export:lenders": "node scripts/export-lenders.js"
   },
   "engines": {
     "node": ">=18.0.0"
