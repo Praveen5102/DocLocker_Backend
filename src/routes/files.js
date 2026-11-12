@@ -193,6 +193,13 @@ router.post('/upload', verifyJWT, requireStaff, scopedUpload(upload.single('file
       });
       return res.status(422).json({ success: false, rejected: true, error: out.reason });
     }
+    // Staff adding a document to a student's file is audited like the
+    // student's own uploads, under the staff member's name and role.
+    logAudit({
+      actor: req.admin.name, role: req.admin.role, action: 'document.upload',
+      target: ref.key,
+      details: { subFolder: sanitize(subFolder), fileName: out.result.fileName, ...(out.result.reader && { check: out.result.reader.gate.status }) },
+    });
     res.json({ success: true, ...out.result });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ success: false, error: err.message });
