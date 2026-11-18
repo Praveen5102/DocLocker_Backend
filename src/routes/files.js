@@ -9,8 +9,10 @@ const { convertToPdf, convertHtmlToPdf } = require('../services/pdf');
 const { parseDocument }                  = require('../services/documentParser');
 const { buildEligibilityHtml }           = require('../services/eligibilityReport');
 const {
-  resolveStudent, readMeta, writeMeta, storeDocument, listDocuments, readDocumentBytes,
+  resolveStudent, updateMeta, storeDocument, listDocuments, readDocumentBytes,
 } = require('../services/studentStore');
+const { mergeRecord } = require('../services/recordMerge');
+const { studentChanged } = require('../services/studentEvents');
 const { readerForSlot, slotBase, checkUpload } = require('../services/uploadGate');
 const { summarizeResult, toLegacyParsed } = require('../services/documentReader');
 const { studentsCache }                  = require('../services/cache');
@@ -34,6 +36,14 @@ async function keepUnlistedConsultancy(admin, ref, existing, next) {
   if (!after || after === before) return;
   if (await findExact(ref.orgId, after).catch(() => null)) return;
   next.personalInfo = { ...(next.personalInfo || {}), consultantNameLoc: before };
+}
+
+// The copy of the record the editor started from (optional; older clients
+// don't send it and their save replaces the record as before).
+// Returns null when absent, false when it isn't valid JSON.
+function parseBase(baseJson) {
+  if (baseJson === undefined || baseJson === null || baseJson === '') return null;
+  try { return JSON.parse(baseJson); } catch { return false; }
 }
 
 // Saves an uploaded (and already converted) document for either kind of
@@ -64,6 +74,7 @@ async function saveUpload(ref, { subFolder, fileName, file, converted, uploadedB
       trashFilesByNameExcept(subDir.id, fileName, uploaded.id),
       trashFilesByNameExcept(subDir.id, cleanNameNoExt + '.pdf', uploaded.id),
     ]);
+    studentChanged(ref); // Railway uploads report this from storeDocument
   }
 
   let parsedData = null;
@@ -152,6 +163,7 @@ async function saveGeneratedPdf(ref, fileName, buffer, uploadedBy) {
     trashFilesByNameExcept(ref.dir.id,   fileName, uploaded.id),
     trashFilesByNameExcept(othersDir.id, fileName, uploaded.id),
   ]);
+  studentChanged(ref);
   return uploaded;
 }
 
@@ -218,14 +230,20 @@ router.post('/meta', verifyJWT, requireStaff, async (req, res) => {
     try { metaObj = JSON.parse(metaJson); }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
 
+    const base = parseBase(req.body.baseJson);
+    if (base === false) return res.status(400).json({ success: false, error: 'Invalid JSON in baseJson' });
+
     const ref  = await staffStudent(req.admin, cleanFolderKey(studentName), { create: true });
-    const existing = await readMeta(ref).catch(() => ({}));
-    const next = mergeStudentMeta(existing, metaObj, req.admin);
-    await keepUnlistedConsultancy(req.admin, ref, existing, next);
-    const file = await writeMeta(ref, next);
+    // Locked read-merge-write: only this editor's own changes land on the
+    // stored record (see services/recordMerge.js).
+    await updateMeta(ref, async (existing) => {
+      const next = mergeStudentMeta(existing, mergeRecord(base, metaObj, existing), req.admin);
+      await keepUnlistedConsultancy(req.admin, ref, existing, next);
+      return next;
+    });
 
     studentsCache.clear();
-    res.json({ success: true, ...(file && file.id && { fileId: file.id }) });
+    res.json({ success: true });
   } catch (err) {
     if (err.status) return res.status(err.status).json({ success: false, error: err.message });
     console.error('saveMeta error:', err.message);
@@ -384,11 +402,13 @@ router.post('/student-meta', requireApplicant, async (req, res) => {
     let metaObj;
     try { metaObj = JSON.parse(metaJson); }
     catch { return res.status(400).json({ success: false, error: 'Invalid JSON in metaJson' }); }
+    const base = parseBase(req.body.baseJson);
+    if (base === false) return res.status(400).json({ success: false, error: 'Invalid JSON in baseJson' });
     const ref = req.studentRef;
 
-    // Staff-owned fields (loan status, lender sharing…) keep their stored values.
-    const existing = await readMeta(ref).catch(() => ({}));
-    await writeMeta(ref, mergeStudentMeta(existing, metaObj, 'student'));
+    // Staff-owned fields (loan status, lender sharing…) keep their stored
+    // values, and changes staff made since the portal loaded are kept.
+    await updateMeta(ref, (existing) => mergeStudentMeta(existing, mergeRecord(base, metaObj, existing), 'student'));
 
     studentsCache.clear();
     logAudit({

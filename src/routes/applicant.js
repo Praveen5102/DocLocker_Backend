@@ -4,7 +4,7 @@
 const express = require('express');
 const archiver = require('archiver');
 const { sanitize, buildFolderKey } = require('../services/drive');
-const { resolveStudent, resolveOrCreateStudent, readMeta, writeMeta, updateMeta } = require('../services/studentStore');
+const { resolveStudent, resolveOrCreateStudent, readMeta, updateMeta } = require('../services/studentStore');
 const { verifyJWT, requireStaff, studentCompany, requireApplicant } = require('../middleware/auth');
 const { staffStudent } = require('../services/access');
 const { mergeStudentMeta } = require('../services/protectedMeta');
@@ -14,7 +14,7 @@ const { pinProblem, hasPin, setPin, checkPin, resetPin, signApplicantToken } = r
 const { visibleFiles, fileBytes } = require('../services/studentFiles');
 const { getCompany, publicCompany } = require('../services/companies');
 const { findCompanyBySlug, ownerOrgId, runWithScope } = require('../services/tenantScope');
-const { findByName } = require('../services/accounts');
+const { findByName, listAccounts } = require('../services/accounts');
 const { studentsCache } = require('../services/cache');
 const { logAudit } = require('../services/auditLog');
 const { query } = require('../db');
@@ -76,8 +76,29 @@ async function refFor(found) {
   return ref && ref.orgId === found.orgId ? ref : null;
 }
 
+// Active advisors of one company, by name: its advisors, plus (for
+// Flyurdream) superadmins who chose to work as advisors. Another company's
+// staff are never included.
+async function companyAdvisors(orgId) {
+  const people = await listAccounts({ orgIds: [orgId], roles: ['advisor', 'superadmin'] });
+  return [...new Set(people
+    .filter((a) => a.status === 'active' && (a.role === 'advisor' || a.actsAsAdvisor))
+    .map((a) => a.name))].sort((a, b) => a.localeCompare(b));
+}
+
+// GET /api/applicant/advisors — names for the signup form's advisor picker,
+// for the company whose signup link this is. Names only.
+router.get('/advisors', studentCompany, async (req, res) => {
+  try {
+    res.json({ success: true, advisors: await companyAdvisors(req.companyId) });
+  } catch (err) {
+    console.error('applicant advisors error:', err.message);
+    fail(res, 500, 'Internal server error');
+  }
+});
+
 // ── Registration ───────────────────────────────────────────────────────────
-// POST /api/applicant/register { name, email, phone, pin, applicationId? }
+// POST /api/applicant/register { name, email, phone, pin, applicationId?, advisor? }
 router.post('/register', studentCompany, async (req, res) => {
   try {
     const name = String(req.body?.name || '').trim().replace(/\s+/g, ' ');
@@ -89,6 +110,14 @@ router.post('/register', studentCompany, async (req, res) => {
     const pinError = pinProblem(req.body?.pin);
     if (pinError) return fail(res, 400, pinError);
 
+    // Chosen advisor: must be an active advisor of this company.
+    const wantedAdvisor = String(req.body?.advisor || '').trim();
+    let advisor = '';
+    if (wantedAdvisor) {
+      advisor = (await companyAdvisors(req.companyId)).find((a) => a.toLowerCase() === wantedAdvisor.toLowerCase()) || '';
+      if (!advisor) return fail(res, 400, 'Choose an advisor from the list');
+    }
+
     const where = { viaCompanyLink: req.viaCompanyLink, companyId: req.companyId };
     for (const id of [parseIdentifier(email), parseIdentifier(phone)]) {
       if (id && (await locateStudent(id, where))) {
@@ -98,15 +127,22 @@ router.post('/register', studentCompany, async (req, res) => {
 
     const ref = await resolveOrCreateStudent(buildFolderKey(sanitize(name), email));
     const applicationId = /^DL-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(String(req.body?.applicationId || '')) ? req.body.applicationId : undefined;
-    const existing = await readMeta(ref).catch(() => ({}));
-    await writeMeta(ref, mergeStudentMeta(existing, {
-      ...existing, name, email, phone, applicationId, createdAt: existing.createdAt || new Date().toISOString(),
-      coApplicants: existing.coApplicants || 1, uploads: existing.uploads || {}, personalInfo: existing.personalInfo || {},
-    }, 'student'));
+    await updateMeta(ref, (existing) => {
+      const next = mergeStudentMeta(existing, {
+        ...existing, name, email, phone, applicationId, createdAt: existing.createdAt || new Date().toISOString(),
+        coApplicants: existing.coApplicants || 1, uploads: existing.uploads || {}, personalInfo: existing.personalInfo || {},
+      }, 'student');
+      // The student's own pick, validated above; never replaces one staff set.
+      if (advisor && !existing.advisor) next.advisor = advisor;
+      return next;
+    });
     const version = await setPin(ref.orgId, ref.key, req.body.pin);
 
     studentsCache.clear();
-    logAudit({ actor: name, role: 'student', action: 'student.register', target: ref.key, details: { storage: ref.kind } });
+    logAudit({
+      actor: name, role: 'student', action: 'student.register', target: ref.key,
+      details: { storage: ref.kind, ...(advisor && { advisor }) },
+    });
     await signedIn(res, ref, version);
   } catch (err) {
     console.error('applicant register error:', err.message);
