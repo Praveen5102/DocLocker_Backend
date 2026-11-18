@@ -23,7 +23,7 @@ const { documentKey, putEncrypted, getDecrypted, deleteObject } = require('./obj
 const {
   ROOT_FOLDER_ID, sanitize, findFolderByName, getOrCreate,
 } = require('./drive');
-const { readStudentMeta, writeStudentMeta } = require('./studentMeta');
+const { readStudentMeta, writeStudentMeta, updateStudentMeta } = require('./studentMeta');
 const { ownerOrgId, scopeOrgIds, homeOrgId, includesOwner } = require('./tenantScope');
 
 const GENERATED_FILES = ['Student_Summary.pdf', 'Eligibility_Report.pdf'];
@@ -142,12 +142,7 @@ async function writeMeta(ref, meta) {
 // concurrent edits (e.g. a loan-status change and a banker grant) can't
 // overwrite each other. mutate() may return a new object or edit in place.
 async function updateMeta(ref, mutate) {
-  if (ref.kind === 'drive') {
-    const meta = (await readStudentMeta(ref.dir.id)).meta;
-    const next = (await mutate(meta)) || meta;
-    await writeStudentMeta(ref.dir.id, next);
-    return next;
-  }
+  if (ref.kind === 'drive') return updateStudentMeta(ref.dir.id, mutate);
   return withTransaction(async (client) => {
     const { rows } = await client.query(
       'SELECT record_enc FROM students WHERE id = $1 AND org_id = $2 FOR UPDATE',
