@@ -13,6 +13,7 @@
     "migrate:drive": "node scripts/migrate-drive-to-railway.js",
     "backup": "node scripts/backup.js",
     "backup:verify": "node scripts/backup.js verify",
+    "backup:pdf": "node scripts/pdf-backup.js",
     "export:lenders": "node scripts/export-lenders.js"
   },
   "engines": {

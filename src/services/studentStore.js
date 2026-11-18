@@ -24,6 +24,7 @@ const {
   ROOT_FOLDER_ID, sanitize, findFolderByName, getOrCreate,
 } = require('./drive');
 const { readStudentMeta, writeStudentMeta, updateStudentMeta } = require('./studentMeta');
+const { studentChanged } = require('./studentEvents');
 const { ownerOrgId, scopeOrgIds, homeOrgId, includesOwner } = require('./tenantScope');
 
 const GENERATED_FILES = ['Student_Summary.pdf', 'Eligibility_Report.pdf'];
@@ -134,14 +135,23 @@ async function saveRailwayMeta(client, ref, meta) {
 }
 
 async function writeMeta(ref, meta) {
-  if (ref.kind === 'drive') return writeStudentMeta(ref.dir.id, meta);
-  return saveRailwayMeta({ query }, ref, meta);
+  const out = ref.kind === 'drive'
+    ? await writeStudentMeta(ref.dir.id, meta)
+    : await saveRailwayMeta({ query }, ref, meta);
+  studentChanged(ref);
+  return out;
 }
 
 // Read-modify-write. On Railway the row is locked for the duration, so two
 // concurrent edits (e.g. a loan-status change and a banker grant) can't
 // overwrite each other. mutate() may return a new object or edit in place.
 async function updateMeta(ref, mutate) {
+  const next = await updateMetaInner(ref, mutate);
+  studentChanged(ref);
+  return next;
+}
+
+async function updateMetaInner(ref, mutate) {
   if (ref.kind === 'drive') return updateStudentMeta(ref.dir.id, mutate);
   return withTransaction(async (client) => {
     const { rows } = await client.query(
@@ -276,6 +286,7 @@ async function storeDocument(ref, { section, fileName: rawName, mimeType, buffer
     await deleteObject(key).catch(() => {});
     throw err;
   }
+  studentChanged(ref);
   return { id: toPublicId(documentId), name: fileName };
 }
 

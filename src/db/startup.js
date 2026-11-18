@@ -43,7 +43,11 @@ async function initRailwayStorage({ schedule = false, imports = true } = {}) {
   console.log(ready
     ? '[storage] Railway storage ready (Postgres + encrypted bucket)'
     : `[storage] Railway storage incomplete (bucket: ${parts.bucket}, encryption key: ${parts.encryption}) — using Google Drive`);
-  if (ready && schedule) scheduleBackups();
+  if (ready && schedule) {
+    scheduleBackups();
+    // Readable PDF copies in Drive (lazy: it needs the storage layer loaded).
+    require('../services/pdfBackup').startPdfBackups();
+  }
   return ready;
 }
 
