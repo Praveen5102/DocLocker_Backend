@@ -2,7 +2,7 @@
 // dashboard data (their documents, a zip of them, and their activity).
 // See services/applicantPins.js for how PINs and sessions work.
 const express = require('express');
-const archiver = require('archiver');
+const { createZip, appendFiles } = require('../services/zipStream');
 const { sanitize, buildFolderKey } = require('../services/drive');
 const { resolveStudent, resolveOrCreateStudent, readMeta, updateMeta } = require('../services/studentStore');
 const { verifyJWT, requireStaff, studentCompany, requireApplicant } = require('../middleware/auth');
@@ -299,26 +299,11 @@ router.get('/documents-zip', requireApplicant, async (req, res) => {
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${label}.zip"`);
     res.setHeader('Cache-Control', 'private, no-store');
-    const archive = archiver('zip', { zlib: { level: 5 } });
-    archive.on('error', (err) => {
-      console.error('applicant zip error:', err.message);
-      if (!res.headersSent) res.status(500).end();
-    });
-    archive.pipe(res);
-    const taken = new Set();
-    for (const f of files) {
-      try {
-        const buffer = await fileBytes(req.studentRef, f);
-        if (!buffer) continue;
-        const dir = String(f.group || 'Other').split('/').map(zipSafe).join('/');
-        let name = `${dir}/${zipSafe(f.name)}`;
-        for (let n = 2; taken.has(name); n++) name = `${dir}/${zipSafe(f.name).replace(/(\.[^.]+)?$/, ` (${n})$1`)}`;
-        taken.add(name);
-        archive.append(buffer, { name });
-      } catch (fileErr) {
-        console.warn(`applicant zip: skipping ${f.id} — ${fileErr.message}`);
-      }
-    }
+    const archive = createZip(res, 'applicant');
+    await appendFiles(archive, files, async (f) => ({
+      buffer: await fileBytes(req.studentRef, f),
+      name: `${String(f.group || 'Other').split('/').map(zipSafe).join('/')}/${zipSafe(f.name)}`,
+    }), { onSkip: (f, err) => console.warn(`applicant zip: skipping ${f.id} — ${err.message}`) });
     await archive.finalize();
   } catch (err) {
     console.error('applicant zip error:', err.message);

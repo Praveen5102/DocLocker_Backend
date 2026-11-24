@@ -1,5 +1,5 @@
 const express = require('express');
-const archiver = require('archiver');
+const { createZip, appendFiles } = require('../services/zipStream');
 const multer = require('multer');
 const {
   sanitize, buildFolderKey,
@@ -401,25 +401,12 @@ router.get('/:studentKey/files/zip', verifyJWTOrTicket('zip', (req) => req.param
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${safeFolderKey}_documents.zip"`);
 
-    const archive = archiver('zip', { zlib: { level: 5 } });
-    archive.on('error', (err) => {
-      console.error('archiver error:', err.message);
-      if (!res.headersSent) res.status(500).end();
-    });
-    archive.pipe(res);
-
-    // Fetch and append each file; skip individual failures so one bad file
-    // doesn't abort the whole zip.
-    for (const f of visible) {
-      try {
-        const buf = await fileBytes(ref, f);
-        const entryPath = f.group ? `${f.group}/${f.name}` : f.name;
-        archive.append(buf, { name: entryPath });
-      } catch (fileErr) {
-        console.warn(`zip: skipping "${f.name}" — ${fileErr.message}`);
-      }
-    }
-
+    // Several files fetched at once; one bad file is skipped, never the zip.
+    const archive = createZip(res, 'files');
+    await appendFiles(archive, visible, async (f) => ({
+      buffer: await fileBytes(ref, f),
+      name: f.group ? `${f.group}/${f.name}` : f.name,
+    }), { onSkip: (f, err) => console.warn(`zip: skipping "${f.name}" — ${err.message}`) });
     await archive.finalize();
   } catch (err) {
     console.error('filesZip error:', err.message);

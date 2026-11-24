@@ -77,12 +77,14 @@ async function findRailwayRow(key) {
 }
 
 // → { kind: 'railway', key, studentId, orgId } | { kind: 'drive', key, orgId, dir } | null
-async function resolveStudent(rawKey) {
+// driveFolderId: the student's Drive folder when the caller already found it
+// (e.g. by walking up from one of its files), so it isn't searched again.
+async function resolveStudent(rawKey, { driveFolderId } = {}) {
   const key = studentKeyOf(rawKey);
   const row = await findRailwayRow(key);
   if (row) return { kind: 'railway', key, studentId: row.id, orgId: row.org_id };
   if (!(await includesOwner())) return null;
-  const dir = await findFolderByName(ROOT_FOLDER_ID(), key);
+  const dir = driveFolderId ? { id: driveFolderId, name: key } : await findFolderByName(ROOT_FOLDER_ID(), key);
   return dir ? { kind: 'drive', key, orgId: await ownerOrgId(), dir } : null;
 }
 

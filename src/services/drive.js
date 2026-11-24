@@ -259,29 +259,52 @@ async function getFileMeta(fileId) {
   return res.data;
 }
 
-// Walks a file's ancestors up to ROOT_FOLDER_ID and returns the name of the
-// student folder it lives under (the folder whose direct parent is root),
-// or null if the file isn't under a recognizable student folder at all.
-// Used to authorize banker access to a single file without exposing the
-// whole Drive tree.
-async function findStudentFolderKeyForFile(fileId) {
+// Folders don't move or get renamed in this app, so their name and parent
+// are remembered for a while: opening several documents of one student (or
+// a zip of them) then needs one Drive lookup per file instead of three.
+const FOLDER_TTL_MS = 10 * 60 * 1000;
+const folderMetaCache = new Map();
+async function folderMeta(folderId) {
+  const hit = folderMetaCache.get(folderId);
+  if (hit && hit.expires > Date.now()) return hit.value;
+  const meta = await getFileMeta(folderId);
+  if (meta.mimeType === 'application/vnd.google-apps.folder') {
+    if (folderMetaCache.size > 5000) folderMetaCache.clear();
+    folderMetaCache.set(folderId, { value: meta, expires: Date.now() + FOLDER_TTL_MS });
+  }
+  return meta;
+}
+
+// Walks a file's ancestors up to ROOT_FOLDER_ID → { key, folderId, file }:
+// the student folder it lives under (the folder whose direct parent is
+// root), and the file's own details (so the caller needn't fetch them
+// again). null if the file isn't under a student folder at all. Used to
+// authorize access to a single file without exposing the whole Drive tree.
+async function locateStudentFolderForFile(fileId) {
   const root = ROOT_FOLDER_ID();
-  let current = await getFileMeta(fileId);
+  const file = await getFileMeta(fileId); // never cached: files get replaced
+  let current = file;
   for (let depth = 0; depth < 6; depth++) {
     const parentId = current.parents && current.parents[0];
     if (!parentId) return null;
-    if (parentId === root) return current.name;
-    current = await getFileMeta(parentId);
+    if (parentId === root) return { key: current.name, folderId: current.id, file };
+    current = await folderMeta(parentId);
   }
   return null;
+}
+
+async function findStudentFolderKeyForFile(fileId) {
+  const found = await locateStudentFolderForFile(fileId);
+  return found ? found.key : null;
 }
 
 // Streams raw file bytes straight from Drive — used by the secure proxy
 // endpoint so bankers/staff never need direct Drive permissions; access is
 // gated entirely by our own JWT + folder-ownership check before this is called.
-async function getFileContentStream(fileId) {
+// known: the file's details when the caller already has them.
+async function getFileContentStream(fileId, known = null) {
   const drive = getDrive();
-  const meta = await getFileMeta(fileId);
+  const meta = known || await getFileMeta(fileId);
   const res = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
   return { stream: res.data, mimeType: meta.mimeType, name: meta.name };
 }
@@ -311,5 +334,6 @@ module.exports = {
   uploadBuffer,
   getFileMeta,
   findStudentFolderKeyForFile,
+  locateStudentFolderForFile,
   getFileContentStream,
 };

@@ -1,8 +1,8 @@
 const crypto = require('crypto');
 const express = require('express');
-const archiver = require('archiver');
+const { createZip, appendFiles } = require('../services/zipStream');
 const {
-  ROOT_FOLDER_ID, findFolderByName, findStudentFolderKeyForFile, getFileContentStream, readFileBuffer,
+  locateStudentFolderForFile, getFileContentStream, readFileBuffer,
 } = require('../services/drive');
 const { isRailwayFileId, getDocument, readDocumentBytes, resolveStudent } = require('../services/studentStore');
 const { canSeeStudent } = require('../services/access');
@@ -44,12 +44,15 @@ function auditOpen(req, { studentKey, name, mode }) {
 
 // A Drive file is served only if it sits inside a student folder the caller
 // may see — never an arbitrary Drive id (admins.json, audit logs…).
+// → { ref, file } when the caller may see this Drive file's student, else
+// null. The walk up from the file already finds the student folder and the
+// file's details, so neither is fetched from Drive again.
 async function driveFileStudent(req, fileId) {
   if (!(await includesOwner())) return null; // Drive students are Flyurdream's
-  const folderKey = await findStudentFolderKeyForFile(fileId);
-  if (!folderKey || !(await findFolderByName(ROOT_FOLDER_ID(), folderKey))) return null;
-  const ref = await resolveStudent(folderKey);
-  return ref && (await canSeeStudent(req.admin, ref)) ? ref : null;
+  const found = await locateStudentFolderForFile(fileId);
+  if (!found) return null;
+  const ref = await resolveStudent(found.key, { driveFolderId: found.folderId });
+  return ref && (await canSeeStudent(req.admin, ref)) ? { ref, file: found.file } : null;
 }
 
 async function serveRailwayFile(req, res, fileId, mode) {
@@ -68,11 +71,11 @@ async function serveRailwayFile(req, res, fileId, mode) {
 }
 
 async function serveDriveFile(req, res, fileId, mode) {
-  const ref = await driveFileStudent(req, fileId);
-  if (!ref) return res.status(404).json({ success: false, error: 'File not found' });
-  const folderKey = ref.key;
+  const found = await driveFileStudent(req, fileId);
+  if (!found) return res.status(404).json({ success: false, error: 'File not found' });
+  const folderKey = found.ref.key;
 
-  const { stream, mimeType, name } = await getFileContentStream(fileId);
+  const { stream, mimeType, name } = await getFileContentStream(fileId, found.file);
   auditOpen(req, { studentKey: folderKey, name, mode });
   setFileHeaders(res, { mimeType, name, mode });
   stream.on('error', () => res.status(500).end());
@@ -139,31 +142,16 @@ router.get('/zip/:bundleId', verifyJWTOrTicket('bundle', (req) => req.params.bun
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="${bundle.label}.zip"`);
     res.setHeader('Cache-Control', 'private, no-store');
-    const archive = archiver('zip', { zlib: { level: 5 } });
-    archive.on('error', (err) => {
-      console.error('bundle zip error:', err.message);
-      if (!res.headersSent) res.status(500).end();
-    });
-    archive.pipe(res);
-
-    // One unreadable file is skipped rather than failing the whole zip.
-    const taken = new Set();
-    for (const f of bundle.files) {
-      try {
-        // readDocumentBytes is scoped to the caller's companies; Drive ids
-        // must belong to a student folder they may see.
-        const buffer = isRailwayFileId(f.id)
-          ? (await readDocumentBytes(f.id))?.buffer
-          : (await driveFileStudent(req, f.id)) && (await readFileBuffer(f.id));
-        if (!buffer) continue;
-        let name = f.path;
-        for (let n = 2; taken.has(name); n++) name = f.path.replace(/(\.[^./]+)?$/, ` (${n})$1`);
-        taken.add(name);
-        archive.append(buffer, { name });
-      } catch (fileErr) {
-        console.warn(`bundle zip: skipping ${f.id} — ${fileErr.message}`);
-      }
-    }
+    // Several files fetched at once; one unreadable file is skipped rather
+    // than failing the whole zip. readDocumentBytes is scoped to the caller's
+    // companies; Drive ids must belong to a student folder they may see.
+    const archive = createZip(res, 'bundle');
+    await appendFiles(archive, bundle.files, async (f) => ({
+      buffer: isRailwayFileId(f.id)
+        ? (await readDocumentBytes(f.id))?.buffer
+        : (await driveFileStudent(req, f.id)) && (await readFileBuffer(f.id)),
+      name: f.path,
+    }), { onSkip: (f, err) => console.warn(`bundle zip: skipping ${f.id} — ${err.message}`) });
     await archive.finalize();
   } catch (err) {
     console.error('bundle zip error:', err.message);
